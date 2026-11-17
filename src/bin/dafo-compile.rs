@@ -1,10 +1,12 @@
 //! `dafo-compile`: look at a model, compile it for this Mac's GPU and measure the result, without any host application.
 //!
 //!   dafo-compile inspect MODEL.gguf                      what the model is, what a token reads, what the caches cost
-//!   dafo-compile compile MODEL.gguf [--context N] [--out DIR [--copy-weights]]
+//!   dafo-compile compile MODEL.gguf [--context N] [--out DIR [--copy-weights]] [--projector MMPROJ.gguf]
 //!                                                        build the plans for this machine and report them; with --out, leave
 //!                                                        the compiled model in a folder that `dafo-serve DIR` serves
-//!                                                        (needs a build with `--features host`)
+//!                                                        (needs a build with `--features host`); with --projector the folder also
+//!                                                        holds the vision projector and the plan that reads images (`--features vision`
+//!                                                        to serve them)
 //!   dafo-compile bench   MODEL.gguf [--context N] [--pool N]
 //!                                                        generation and prompt-reading speed on this machine; with --pool N the
 //!                                                        experts are served from a pool of N per layer (the model on disk may have more)
@@ -24,7 +26,7 @@ fn main() -> Result<()> {
     let context = flag(&rest, "--context")?.unwrap_or(8192);
     match command.as_str() {
         "inspect" => inspect(&model, context),
-        "compile" => compile(&model, context, flag_text(&rest, "--out")?, rest.iter().any(|argument| argument == "--copy-weights")),
+        "compile" => compile(&model, context, flag_text(&rest, "--out")?, rest.iter().any(|argument| argument == "--copy-weights"), flag_text(&rest, "--projector")?),
         "bench" => bench(&model, context, flag(&rest, "--pool")?),
         _ => bail!("{}", usage()),
     }
@@ -98,12 +100,12 @@ fn inspect(model: &str, context: usize) -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn compile(model: &str, context: usize, out: Option<String>, copy_weights: bool) -> Result<()> {
+fn compile(model: &str, context: usize, out: Option<String>, copy_weights: bool, projector: Option<String>) -> Result<()> {
     use dafo_compiler_llm::backend_metal;
     let gguf = Gguf::open(model)?;
     let graph = frontends::token_graph(&gguf)?;
     let started = std::time::Instant::now();
-    let plans = backend_metal::compile_plans(&graph, &gguf, context, false)?;
+    let plans = backend_metal::compile_plans(&graph, &gguf, context, projector.is_some())?;
     println!("compiled in {:.2} s for a context of {context} tokens:", started.elapsed().as_secs_f64());
     for plan in &plans {
         println!("  batch {:>4}: {} dispatches, {} scratch buffers", plan.batch, plan.steps.len(), plan.scratch.len());
@@ -114,12 +116,12 @@ fn compile(model: &str, context: usize, out: Option<String>, copy_weights: bool)
     if let Some(directory) = out {
         #[cfg(feature = "host")]
         {
-            dafo_compiler_llm::host::artifact::write(std::path::Path::new(&directory), std::path::Path::new(model), &gguf, &plans, context, copy_weights)?;
+            dafo_compiler_llm::host::artifact::write(std::path::Path::new(&directory), std::path::Path::new(model), &gguf, &plans, context, copy_weights, projector.as_deref().map(std::path::Path::new))?;
             println!("left the compiled model in {directory}/ (manifest.json, model.gguf, tokenizer.json, kernels.metal); serve it with: dafo-serve {directory}");
         }
         #[cfg(not(feature = "host"))]
         {
-            let _ = (directory, copy_weights);
+            let _ = (directory, copy_weights, &projector);
             bail!("--out needs a build with the host: cargo build --release --features host");
         }
     }
@@ -159,7 +161,7 @@ fn bench(model: &str, context: usize, pool: Option<usize>) -> Result<()> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn compile(_: &str, _: usize, _: Option<String>, _: bool) -> Result<()> {
+fn compile(_: &str, _: usize, _: Option<String>, _: bool, _: Option<String>) -> Result<()> {
     bail!("compiling needs a Mac: the first backend targets Metal (inspect works anywhere)")
 }
 

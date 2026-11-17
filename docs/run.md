@@ -42,6 +42,10 @@ curl -s localhost:8091/v1/experts -X POST -H "Authorization: Bearer TOKEN" -d '{
 
 Any OpenAI client works against `http://127.0.0.1:8091/v1` with the token as API key. See [SERVER.md](SERVER.md) for the options, the tools format and limits.
 
+## Images
+
+Build with `--features "host vision"` and put the projector (`mmproj-*.gguf`) beside the model, or pass `--projector FILE`. The chat page attaches images; the API takes `image_url` parts with `data:` URLs. See [the vision encoder](vision.md).
+
 ## Compile to a folder (without the pool)
 
 ```

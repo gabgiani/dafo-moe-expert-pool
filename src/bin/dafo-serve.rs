@@ -57,7 +57,7 @@ mod server {
     }
 
     fn usage() -> &'static str {
-        "usage: dafo-serve MODEL.dafo|MODEL.gguf [--host H] [--port P] [--token T] [--context TOKENS] [--slots N] [--pool EXPERTS [--profile FILE] [--profiles DIR] [--adaptive] [--debug]] [--open]"
+        "usage: dafo-serve MODEL.dafo|MODEL.gguf [--host H] [--port P] [--token T] [--context TOKENS] [--slots N] [--pool EXPERTS [--profile FILE] [--profiles DIR] [--adaptive] [--debug]] [--projector FILE [--visual-tokens N]] [--open]"
     }
 
     fn option(arguments: &[String], name: &str) -> Result<Option<String>> {
@@ -87,13 +87,13 @@ mod server {
         let generated = supplied.is_none();
         let token = supplied.unwrap_or_else(random_token);
 
-        let (weights, tokenizer, name, context) = if artifact::is_artifact(&model) {
+        let (weights, tokenizer, name, context, stored_projector, stored_tokens) = if artifact::is_artifact(&model) {
             let opened = artifact::read(&model)?;
-            (opened.weights, opened.tokenizer, opened.name, context_option.unwrap_or(opened.context))
+            (opened.weights, opened.tokenizer, opened.name, context_option.unwrap_or(opened.context), opened.projector, Some(opened.visual_tokens))
         } else {
             let gguf = Gguf::open(&model)?;
             let name = model.file_stem().map(|stem| stem.to_string_lossy().into_owned()).unwrap_or_else(|| "model".to_owned());
-            (model.clone(), tokenizer::from_gguf(&gguf)?, name, context_option.unwrap_or(DEFAULT_CONTEXT))
+            (model.clone(), tokenizer::from_gguf(&gguf)?, name, context_option.unwrap_or(DEFAULT_CONTEXT), None, None)
         };
         eprintln!("compiling {} for {context} tokens of context, {slots} conversations in cache ...", weights.display());
         let started = std::time::Instant::now();
@@ -101,7 +101,21 @@ mod server {
             Some(size) => Some(dafo_compiler_llm::host::engine::PoolConfig { size: size.parse()?, profile: option(&arguments, "--profile")?.map(Into::into), profiles_dir: option(&arguments, "--profiles")?.map(Into::into), adaptive: arguments.iter().any(|argument| argument == "--adaptive"), debug: arguments.iter().any(|argument| argument == "--debug") }),
             None => None,
         };
-        let engine = Engine::start_with_pool(&weights, tokenizer, context, slots, pool)?;
+        let projector: Option<std::path::PathBuf> = match option(&arguments, "--projector")? {
+            Some(path) => Some(path.into()),
+            // An `mmproj-*.gguf` beside the model is its vision projector.
+            None if stored_projector.is_some() => stored_projector.clone(),
+            None if artifact::is_artifact(&model) => None,
+            None => weights.parent().and_then(|directory| std::fs::read_dir(directory).ok()).and_then(|entries| {
+                entries.filter_map(|entry| entry.ok().map(|entry| entry.path())).find(|path| path.file_name().is_some_and(|name| name.to_string_lossy().starts_with("mmproj") && name.to_string_lossy().ends_with(".gguf")))
+            }),
+        };
+        let projector = if cfg!(feature = "vision") { projector } else { None };
+        if let Some(path) = &projector {
+            eprintln!("vision projector: {}", path.display());
+        }
+        let visual_tokens: usize = option(&arguments, "--visual-tokens")?.map(|value| value.parse()).transpose()?.or(stored_tokens).unwrap_or(560);
+        let engine = Engine::start_with(&weights, tokenizer, context, slots, dafo_compiler_llm::host::engine::EngineOptions { pool, projector, visual_tokens })?;
         eprintln!("ready in {:.1} s on {} ({:.2} GiB of weights mapped)", started.elapsed().as_secs_f64(), engine.device, engine.weight_bytes as f64 / (1u64 << 30) as f64);
 
         let server = Server::http(format!("{host}:{port}")).map_err(|error| anyhow::anyhow!("cannot listen on {host}:{port}: {error}"))?;
@@ -280,7 +294,14 @@ mod server {
         let (events, receiver) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let profile = body.get("dafo_experts").and_then(Value::as_str).map(str::to_owned);
-        let job = Job { prompt, settings, stream: stream_now, cancel: Arc::clone(&cancel), events, profile };
+        let images = match chat::images_of(messages) {
+            Ok(images) => images,
+            Err(message) => return error(request, 400, "invalid_image", &message),
+        };
+        if !images.is_empty() && !state.engine.vision {
+            return error(request, 400, "images_not_supported", "this server has no vision projector: start it with --projector mmproj-....gguf (a build with --features vision)");
+        }
+        let job = Job { prompt, settings, stream: stream_now, cancel: Arc::clone(&cancel), events, profile, images };
         if state.engine.submit(job).is_err() {
             return error(request, 500, "engine_stopped", "the engine stopped");
         }

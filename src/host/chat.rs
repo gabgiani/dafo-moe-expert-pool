@@ -19,7 +19,11 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
-/// The text of a message: a string, or the text parts of a list. Anything else a part may carry (an image) is an error.
+/// What stands in the text of a prompt for an image: the model's own markers around the soft tokens the engine puts there.
+pub const IMAGE_MARKER: &str = "<|image><|image|><image|>";
+
+/// The text of a message: a string, or the text parts of a list, with an image part written as [`IMAGE_MARKER`] (the image itself travels
+/// separately: see [`images_of`]). Any other kind of part is an error.
 fn message_text(message: &Value) -> Result<String, String> {
     match message.get("content") {
         None | Some(Value::Null) => Ok(String::new()),
@@ -29,8 +33,9 @@ fn message_text(message: &Value) -> Result<String, String> {
             for part in parts {
                 match part.get("type").and_then(Value::as_str) {
                     Some("text") => text.push_str(part.get("text").and_then(Value::as_str).unwrap_or("")),
+                    Some("image_url") => text.push_str(IMAGE_MARKER),
                     Some(other) => {
-                        return Err(format!("content of type `{other}` is not supported yet: this server reads text (images need the vision encoder, which is not in the standalone server)"));
+                        return Err(format!("content of type `{other}` is not supported: this server reads text and images (`image_url` with a data: URL)"));
                     }
                     None => return Err("a content part has no type".to_owned()),
                 }
@@ -39,6 +44,54 @@ fn message_text(message: &Value) -> Result<String, String> {
         }
         Some(_) => Err("message content must be a string or a list of parts".to_owned()),
     }
+}
+
+/// The images of `messages`, in the order they appear: each `image_url` part must be a `data:` URL with base64 content.
+pub fn images_of(messages: &[Value]) -> Result<Vec<Vec<u8>>, String> {
+    let mut images = Vec::new();
+    for message in messages {
+        let Some(Value::Array(parts)) = message.get("content") else { continue };
+        for part in parts {
+            if part.get("type").and_then(Value::as_str) != Some("image_url") {
+                continue;
+            }
+            let url = match part.get("image_url") {
+                Some(Value::String(url)) => url.as_str(),
+                Some(object) => object.get("url").and_then(Value::as_str).unwrap_or(""),
+                None => "",
+            };
+            let Some(encoded) = url.strip_prefix("data:").and_then(|rest| rest.split_once(";base64,")).map(|(_, data)| data) else {
+                return Err("an image must be a `data:<type>;base64,...` URL (links to other sites are not fetched)".to_owned());
+            };
+            images.push(base64_decode(encoded).ok_or_else(|| "an image is not valid base64".to_owned())?);
+        }
+    }
+    Ok(images)
+}
+
+/// Standard base64 (with or without padding); whitespace is ignored.
+pub fn base64_decode(text: &str) -> Option<Vec<u8>> {
+    let (mut out, mut buffer, mut bits) = (Vec::with_capacity(text.len() / 4 * 3), 0u32, 0u32);
+    for byte in text.bytes() {
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            b'=' => break,
+            b' ' | b'\n' | b'\r' | b'\t' => continue,
+            _ => return None,
+        };
+        buffer = (buffer << 6) | value as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buffer >> bits) as u8);
+            buffer &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
 }
 
 /// The prompt for `messages`, with `tools` declared. `thinking` lets the model reason first; otherwise its thought is closed empty.
@@ -270,9 +323,19 @@ mod tests {
     }
 
     #[test]
-    fn an_image_is_refused_with_a_reason() {
-        let messages = vec![json!({"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}]})];
-        assert!(render(&messages, &[], false).unwrap_err().contains("vision"));
+    fn an_image_becomes_a_marker_and_travels_apart() {
+        let messages = vec![json!({"role": "user", "content": [{"type": "text", "text": "What is this?"}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAEC"}}]})];
+        assert!(render(&messages, &[], false).unwrap().contains(&format!("What is this?{IMAGE_MARKER}")));
+        assert_eq!(images_of(&messages).unwrap(), vec![vec![0u8, 1, 2]]);
+        let remote = vec![json!({"role": "user", "content": [{"type": "image_url", "image_url": {"url": "https://example.org/a.png"}}]})];
+        assert!(images_of(&remote).unwrap_err().contains("data:"));
+    }
+
+    #[test]
+    fn base64_reads_padded_and_unpadded_text() {
+        assert_eq!(base64_decode("aGVsbG8=").unwrap(), b"hello");
+        assert_eq!(base64_decode("aGVsbG8").unwrap(), b"hello");
+        assert!(base64_decode("a!b").is_none());
     }
 
     #[test]

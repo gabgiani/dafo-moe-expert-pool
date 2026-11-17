@@ -43,6 +43,7 @@ version number for it.
 | `--profiles DIR` | a folder of `name.json` profiles a request or `POST /v1/experts` can switch to |
 | `--adaptive` | exchange experts by what the requests ask for, until the pool settles ([adaptive pool](adaptive.md)) |
 | `--debug` | after every request, print the share of the pool that was exchanged, per layer; the chat header shows it too |
+| `--projector FILE` | the vision projector (`mmproj-*.gguf`; one beside the model is found by itself); needs a build with `--features vision`. [How it works](vision.md) |
 | `--open` | open the chat page in the browser; the link carries the token (`#token=...`) so nothing has to be typed |
 
 `GET /v1/experts` reports the mode (`manual`, `adapting`, `frozen`), the profiles, how much of the pool changed after the last prompt and after
@@ -75,8 +76,8 @@ with code `context_length_exceeded`.
 
 `GET /` serves a page with no external resources: token field (kept in the browser), system prompt, streaming, a stop button, tokens
 per second, and attachments. **Attachments are text files** (`.txt`, `.md`, `.csv`, `.json`, code…): the page puts their content in the
-message, up to 400 kB each. Images are not supported by the standalone server: reading them needs the vision encoder, which lives in
-DAFO Swarm and not in this repository; a request with an image part gets a 400 that says so.
+message, up to 400 kB each. **Images** (PNG, JPEG, WebP, up to 8 MB) are attached too when the server has a vision projector (`--projector`, built with
+`--features vision`): they travel as `image_url` parts with `data:` URLs; without a projector a request with an image gets a 400 that says so. See [vision.md](vision.md).
 
 ## Limits
 

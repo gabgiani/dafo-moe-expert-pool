@@ -43,6 +43,18 @@ pub struct Job {
     pub events: Sender<Event>,
     /// A profile (by name) the experts must be switched to before this request; `None` keeps what the pool holds.
     pub profile: Option<String>,
+    /// The images of the prompt, in order (each stands at an image marker of the text).
+    pub images: Vec<Vec<u8>>,
+}
+
+/// Optional parts of an engine.
+#[derive(Clone, Debug, Default)]
+pub struct EngineOptions {
+    pub pool: Option<PoolConfig>,
+    /// The vision projector (`mmproj-*.gguf`): with it the engine reads images (needs the `vision` feature).
+    pub projector: Option<std::path::PathBuf>,
+    /// Most soft tokens one image may use (70, 140, 280, 560 or 1120).
+    pub visual_tokens: usize,
 }
 
 pub struct Engine {
@@ -56,6 +68,8 @@ pub struct Engine {
     pub slots: usize,
     pub device: String,
     pub weight_bytes: usize,
+    /// Whether the engine reads images.
+    pub vision: bool,
 }
 
 struct Slot {
@@ -78,34 +92,8 @@ pub struct PoolConfig {
     pub debug: bool,
 }
 
-/// Experts to keep per layer, by layer.
-pub type Profile = Vec<(usize, Vec<usize>)>;
-
-/// How the pool is kept: moving experts by what the router keeps asking for, or settled on a block.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Mode {
-    /// The pool does not change by itself.
-    Manual,
-    /// After every request the experts the router wanted most replace the ones it wanted least, while that still changes things.
-    Adapting,
-    /// The pool settled: the same block of experts stays resident and nothing is exchanged any more.
-    Frozen,
-}
-
-/// What the adaptive pool reports.
-#[derive(Clone, Debug)]
-pub struct AdaptiveStatus {
-    pub mode: Mode,
-    /// Experts replaced after the last request, and the share of what the router wanted that was outside the pool.
-    pub last_swaps: usize,
-    pub last_miss: f64,
-    pub requests: u64,
-    /// Share of the pool's slots (experts per layer × layers) exchanged after reading the last prompt, and after the last answer.
-    pub prefill_changed_percent: f64,
-    pub changed_percent: f64,
-    /// Experts exchanged per layer after the last answer.
-    pub per_layer: Vec<usize>,
-}
+pub use crate::pool::{AdaptiveStatus, Mode, Profile};
+use crate::pool::AdaptivePool;
 
 /// A command for the adaptive pool.
 #[derive(Clone, Debug)]
@@ -139,11 +127,18 @@ pub fn read_profile(path: &Path) -> Result<Vec<(usize, Vec<usize>)>> {
 impl Engine {
     /// Compiles `weights` for `context` tokens and starts serving on a thread.
     pub fn start(weights: &Path, tokenizer: Tokenizer, context: usize, slots: usize) -> Result<Self> {
-        Self::start_with_pool(weights, tokenizer, context, slots, None)
+        Self::start_with(weights, tokenizer, context, slots, EngineOptions::default())
     }
 
     /// Like [`Engine::start`]; with a pool the model's expert tensors are kept in a pool of experts that can be changed (see [`PoolConfig`]).
     pub fn start_with_pool(weights: &Path, tokenizer: Tokenizer, context: usize, slots: usize, pool: Option<PoolConfig>) -> Result<Self> {
+        Self::start_with(weights, tokenizer, context, slots, EngineOptions { pool, ..Default::default() })
+    }
+
+    /// The general form: a pool, a vision projector.
+    pub fn start_with(weights: &Path, tokenizer: Tokenizer, context: usize, slots: usize, options: EngineOptions) -> Result<Self> {
+        let EngineOptions { pool, projector, visual_tokens } = options;
+        let visual_tokens = if visual_tokens == 0 { 560 } else { visual_tokens };
         let weights = weights.to_path_buf();
         let (jobs, receiver) = mpsc::channel::<Message>();
         let mut profiles: std::collections::BTreeMap<String, Profile> = Default::default();
@@ -160,19 +155,22 @@ impl Engine {
         let stored = profiles.clone();
         let current = Arc::new(std::sync::Mutex::new(pool.as_ref().and_then(|pool| pool.profile.as_ref()).map(|path| path.file_stem().map(|stem| stem.to_string_lossy().into_owned()).unwrap_or_default()).unwrap_or_default()));
         let shared_current = Arc::clone(&current);
-        let status = Arc::new(std::sync::Mutex::new(AdaptiveStatus { mode: if pool.as_ref().is_some_and(|pool| pool.adaptive) { Mode::Adapting } else { Mode::Manual }, last_swaps: 0, last_miss: 0.0, requests: 0, prefill_changed_percent: 0.0, changed_percent: 0.0, per_layer: Vec::new() }));
-        let shared_status = Arc::clone(&status);
+        let adaptive_pool = AdaptivePool::new(0, pool.as_ref().is_some_and(|pool| pool.adaptive), pool.as_ref().is_some_and(|pool| pool.debug));
+        let status = Arc::clone(&adaptive_pool.status);
         let profiles_dir = pool.as_ref().and_then(|pool| pool.profiles_dir.clone());
-        let debug = pool.as_ref().is_some_and(|pool| pool.debug);
-        let (ready_sender, ready) = mpsc::channel::<Result<(String, usize)>>();
+        let (ready_sender, ready) = mpsc::channel::<Result<(String, usize, bool)>>();
         std::thread::Builder::new().name("dafo-engine".into()).spawn(move || {
-            let built = (|| -> Result<(Arc<Gguf>, Runtime)> {
+            let built = (|| -> Result<(Arc<Gguf>, Runtime, Option<Vision>)> {
                 let gguf = Arc::new(Gguf::open(&weights)?);
                 let mut graph = frontends::token_graph(&gguf)?;
                 if let Some(pool) = &pool {
                     backend_metal::use_expert_pool(&mut graph, pool.size);
                 }
-                let plans = backend_metal::compile_plans(&graph, &gguf, context, false)?;
+                let vision = match &projector {
+                    Some(path) => Some(open_vision(path, visual_tokens)?),
+                    None => None,
+                };
+                let plans = backend_metal::compile_plans(&graph, &gguf, context, vision.is_some())?;
                 let mut runtime = Runtime::with_expert_pool(&gguf, &plans, slots, pool.as_ref().map(|pool| pool.size))?;
                 if let Some(profile) = pool.as_ref().and_then(|pool| pool.profile.as_ref()) {
                     let total = gguf.tensor("blk.0.ffn_gate_inp.weight").context("a mixture-of-experts model")?.dims[1] as usize;
@@ -183,20 +181,23 @@ impl Engine {
                     }
                     eprintln!("experts of {} loaded into the pool: {copied} copied in {:.1} s", profile.display(), started.elapsed().as_secs_f64());
                 }
-                Ok((gguf, runtime))
+                Ok((gguf, runtime, vision))
             })();
             match built {
-                Ok((gguf, runtime)) => {
-                    let _ = ready_sender.send(Ok((runtime.device_name(), runtime.weight_bytes())));
-                    Worker::new(&gguf, runtime, tokenizer, context, slots, profiles, shared_current, shared_status, profiles_dir, debug).run(receiver);
+                Ok((gguf, runtime, vision)) => {
+                    let _ = ready_sender.send(Ok((runtime.device_name(), runtime.weight_bytes(), vision.is_some())));
+                    let total = gguf.tensor("blk.0.ffn_gate_inp.weight").map(|tensor| tensor.dims[1] as usize).unwrap_or(0);
+                    let mut adaptive_pool = adaptive_pool;
+                    adaptive_pool.set_total(total);
+                    Worker::new(&gguf, runtime, tokenizer, context, slots, profiles, shared_current, adaptive_pool, profiles_dir, vision).run(receiver);
                 }
                 Err(error) => {
                     let _ = ready_sender.send(Err(error));
                 }
             }
         })?;
-        let (device, weight_bytes) = ready.recv().context("the engine thread stopped while loading")??;
-        Ok(Self { jobs, profiles: names, stored, current_profile: current, adaptive: status, context, slots, device, weight_bytes })
+        let (device, weight_bytes, vision) = ready.recv().context("the engine thread stopped while loading")??;
+        Ok(Self { jobs, profiles: names, stored, current_profile: current, adaptive: status, context, slots, device, weight_bytes, vision })
     }
 
     pub fn submit(&self, job: Job) -> Result<()> {
@@ -222,6 +223,39 @@ impl Engine {
     }
 }
 
+/// The vision encoder, when the engine was built with the `vision` feature.
+#[cfg(feature = "vision")]
+type Vision = crate::vision::VisionEncoder;
+#[cfg(not(feature = "vision"))]
+enum Vision {}
+
+#[cfg(feature = "vision")]
+fn open_vision(path: &Path, visual_tokens: usize) -> Result<Vision> {
+    crate::vision::VisionEncoder::open(path, visual_tokens)
+}
+#[cfg(not(feature = "vision"))]
+fn open_vision(_: &Path, _: usize) -> Result<Vision> {
+    anyhow::bail!("this build has no vision encoder: build with --features vision")
+}
+
+/// Marks a token id that stands for a soft token of an image (the id carries the image's digest, so a conversation that shows the same
+/// image again finds it in the cache and a different one does not).
+const IMAGE_TOKEN_FLAG: u32 = 0x8000_0000;
+/// Images whose embeddings the engine keeps.
+const IMAGE_CACHE: usize = 8;
+
+/// The soft tokens of an image at some place of the prompt.
+struct ImageRun {
+    start: usize,
+    len: usize,
+    width: usize,
+    embeddings: Arc<Vec<f32>>,
+}
+
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| (hash ^ *byte as u64).wrapping_mul(0x0100_0000_01b3))
+}
+
 struct Worker {
     runtime: Runtime,
     tokenizer: Tokenizer,
@@ -232,33 +266,21 @@ struct Worker {
     profiles: std::collections::BTreeMap<String, Profile>,
     current_profile: Arc<std::sync::Mutex<String>>,
     experts_total: usize,
-    status: Arc<std::sync::Mutex<AdaptiveStatus>>,
+    pool: AdaptivePool,
     profiles_dir: Option<std::path::PathBuf>,
-    /// Per layer and expert: a running score of how much the router wanted it (each request weighs the same).
-    score: Vec<Vec<f64>>,
-    calm: usize,
-    frozen_miss: f64,
-    hot: usize,
-    debug: bool,
+    vision: Option<Vision>,
+    /// Embeddings of the images seen lately, by hash of their bytes (oldest first).
+    image_cache: Vec<(u64, Arc<Vec<f32>>, usize)>,
 }
 
-/// Requests in a row that exchange (almost) nothing before the pool settles.
-const CALM_REQUESTS: usize = 3;
-/// An expert enters the pool only when it was wanted this much more than the one it replaces.
-const SWAP_MARGIN: f64 = 1.25;
-/// Share of the pool a request may exchange and still count as calm.
-const CALM_SHARE: f64 = 0.01;
-/// A settled pool resumes exchanging when this many requests in a row miss this much more than when it settled.
-const THAW_REQUESTS: usize = 3;
-
 impl Worker {
-    fn new(gguf: &Gguf, runtime: Runtime, tokenizer: Tokenizer, context: usize, slots: usize, profiles: std::collections::BTreeMap<String, Profile>, current_profile: Arc<std::sync::Mutex<String>>, status: Arc<std::sync::Mutex<AdaptiveStatus>>, profiles_dir: Option<std::path::PathBuf>, debug: bool) -> Self {
+    fn new(gguf: &Gguf, runtime: Runtime, tokenizer: Tokenizer, context: usize, slots: usize, profiles: std::collections::BTreeMap<String, Profile>, current_profile: Arc<std::sync::Mutex<String>>, pool: AdaptivePool, profiles_dir: Option<std::path::PathBuf>, vision: Option<Vision>) -> Self {
         let mut stop_tokens = Vec::new();
         if let Some(Scalar::Unsigned(eos)) = gguf.metadata("tokenizer.ggml.eos_token_id") {
             stop_tokens.push(*eos as u32);
         }
         stop_tokens.extend(["<turn|>", "<|tool_response>"].iter().filter_map(|token| tokenizer.token_to_id(token)));
-        Self { runtime, tokenizer, slots: (0..slots).map(|_| Slot { history: Vec::new(), last_used: 0 }).collect(), context, stop_tokens, clock: 0, profiles, current_profile, experts_total: gguf.tensor("blk.0.ffn_gate_inp.weight").map(|tensor| tensor.dims[1] as usize).unwrap_or(0), status, profiles_dir, score: Vec::new(), calm: 0, frozen_miss: 0.0, hot: 0, debug }
+        Self { runtime, tokenizer, slots: (0..slots).map(|_| Slot { history: Vec::new(), last_used: 0 }).collect(), context, stop_tokens, clock: 0, profiles, current_profile, experts_total: gguf.tensor("blk.0.ffn_gate_inp.weight").map(|tensor| tensor.dims[1] as usize).unwrap_or(0), pool, profiles_dir, vision, image_cache: Vec::new() }
     }
 
     fn run(mut self, messages: Receiver<Message>) {
@@ -278,7 +300,11 @@ impl Worker {
                     if let Err(error) = self.serve(&job) {
                         let _ = events.send(Event::Failed { code: "engine_error", message: format!("{error:#}") });
                     }
-                    self.adapt(false);
+                    if let Some(block) = self.pool.after_request(&mut self.runtime) {
+                        let _ = self.save_profile("settled", &block);
+                        self.profiles.insert("settled".to_owned(), block);
+                        *self.current_profile.lock().unwrap() = "settled".to_owned();
+                    }
                 }
                 Message::Adaptive { command, reply } => {
                     let result = self.command(command).map_err(|error| format!("{error:#}"));
@@ -293,25 +319,17 @@ impl Worker {
     }
 
     fn command(&mut self, command: AdaptiveCommand) -> Result<String> {
-        let (size, layers) = self.runtime.pool_shape().context("the model is not served from an expert pool (--pool)")?;
-        let _ = size;
+        let (_, layers) = self.runtime.pool_shape().context("the model is not served from an expert pool (--pool)")?;
         match command {
             AdaptiveCommand::Enable(on) => {
-                let mut status = self.status.lock().unwrap();
-                status.mode = if on { Mode::Adapting } else { Mode::Manual };
-                self.calm = 0;
-                self.hot = 0;
+                self.pool.enable(on);
                 Ok(format!("experts are {}", if on { "exchanged by what the requests ask for" } else { "left as they are" }))
             }
             AdaptiveCommand::Freeze { save_as } => {
-                self.status.lock().unwrap().mode = Mode::Frozen;
-                let block: Profile = (0..layers).map(|layer| (layer, self.runtime.resident_experts(layer))).collect();
+                let block = self.pool.freeze(&self.runtime)?;
                 let name = save_as.unwrap_or_else(|| "frozen".to_owned());
                 let mut note = format!("the pool stays on its current block of experts ({layers} layers)");
-                if let Some(directory) = &self.profiles_dir {
-                    let object: serde_json::Map<String, serde_json::Value> = block.iter().map(|(layer, ids)| (layer.to_string(), serde_json::Value::from(ids.clone()))).collect();
-                    let path = directory.join(format!("{name}.json"));
-                    std::fs::write(&path, serde_json::to_string(&object)?)?;
+                if let Some(path) = self.save_profile(&name, &block)? {
                     note.push_str(&format!("; saved as {}", path.display()));
                 }
                 self.profiles.insert(name.clone(), block);
@@ -321,122 +339,12 @@ impl Worker {
         }
     }
 
-    /// After a request: see what the router wanted, exchange experts if that still helps, and settle when it stops helping.
-    fn adapt(&mut self, during_prefill: bool) {
-        let Some((size, layers)) = self.runtime.pool_shape() else { return };
-        if during_prefill && self.status.lock().unwrap().mode != Mode::Adapting {
-            return;
-        }
-        let total = self.experts_total;
-        let demand = self.runtime.take_demand(layers, total);
-        let mode = self.status.lock().unwrap().mode;
-        let (mut wanted, mut missed) = (0u64, 0u64);
-        let mut resident_sets: Vec<std::collections::HashSet<usize>> = Vec::with_capacity(layers);
-        for layer in 0..layers {
-            let resident: std::collections::HashSet<usize> = self.runtime.resident_experts(layer).into_iter().collect();
-            for (expert, &count) in demand[layer].iter().enumerate() {
-                wanted += count as u64;
-                if !resident.contains(&expert) {
-                    missed += count as u64;
-                }
-            }
-            resident_sets.push(resident);
-        }
-        if wanted == 0 {
-            return;
-        }
-        let miss = missed as f64 / wanted as f64;
-        let mut swaps = 0;
-        let mut per_layer = vec![0usize; layers];
-        let slots_total = (size * layers).max(1) as f64;
-        match mode {
-            Mode::Manual => {}
-            Mode::Frozen => {
-                if miss > self.frozen_miss * 1.5 + 0.05 {
-                    self.hot += 1;
-                } else {
-                    self.hot = 0;
-                }
-                if self.hot >= THAW_REQUESTS {
-                    eprintln!("experts: the requests miss {:.0} % of what the router wants (was {:.0} % when settled): exchanging again", miss * 100.0, self.frozen_miss * 100.0);
-                    self.status.lock().unwrap().mode = Mode::Adapting;
-                    self.hot = 0;
-                    self.calm = 0;
-                }
-            }
-            Mode::Adapting => {
-                if self.score.len() != layers {
-                    self.score = vec![vec![0.0; total]; layers];
-                }
-                for layer in 0..layers {
-                    let sum: f64 = demand[layer].iter().map(|&count| count as f64).sum::<f64>().max(1.0);
-                    for expert in 0..total {
-                        self.score[layer][expert] = 0.6 * self.score[layer][expert] + 0.4 * demand[layer][expert] as f64 / sum;
-                    }
-                    let mut resident: Vec<usize> = resident_sets[layer].iter().copied().collect();
-                    let mut outside: Vec<usize> = (0..total).filter(|expert| !resident_sets[layer].contains(expert)).collect();
-                    resident.sort_by(|a, b| self.score[layer][*a].partial_cmp(&self.score[layer][*b]).unwrap());
-                    outside.sort_by(|a, b| self.score[layer][*b].partial_cmp(&self.score[layer][*a]).unwrap());
-                    let mut next: std::collections::HashSet<usize> = resident_sets[layer].clone();
-                    let mut changed = 0;
-                    for (weakest, strongest) in resident.iter().zip(outside.iter()) {
-                        if self.score[layer][*strongest] > SWAP_MARGIN * self.score[layer][*weakest] + 1e-6 {
-                            next.remove(weakest);
-                            next.insert(*strongest);
-                            changed += 1;
-                        } else {
-                            break;
-                        }
-                    }
-                    if changed > 0 {
-                        let ids: Vec<usize> = next.into_iter().collect();
-                        if self.runtime.set_allowed_experts(layer, &ids, total).is_ok() {
-                            swaps += changed;
-                            per_layer[layer] = changed;
-                        }
-                    }
-                }
-                if during_prefill {
-                    let percent = 100.0 * swaps as f64 / slots_total;
-                    eprintln!("experts: after reading the prompt the router wanted {:.1} % outside the pool; {swaps} experts exchanged before answering ({percent:.1} % of the pool changed)", miss * 100.0);
-                    if self.debug {
-                        eprintln!("  debug, per layer: {per_layer:?}");
-                    }
-                    self.status.lock().unwrap().prefill_changed_percent = percent;
-                    return;
-                }
-                if swaps as f64 <= CALM_SHARE * (size * layers) as f64 {
-                    self.calm += 1;
-                } else {
-                    self.calm = 0;
-                }
-                if self.calm >= CALM_REQUESTS {
-                    self.status.lock().unwrap().mode = Mode::Frozen;
-                    self.frozen_miss = miss;
-                    self.hot = 0;
-                    let block: Profile = (0..layers).map(|layer| (layer, self.runtime.resident_experts(layer))).collect();
-                    self.profiles.insert("settled".to_owned(), block.clone());
-                    *self.current_profile.lock().unwrap() = "settled".to_owned();
-                    if let Some(directory) = &self.profiles_dir {
-                        let object: serde_json::Map<String, serde_json::Value> = block.iter().map(|(layer, ids)| (layer.to_string(), serde_json::Value::from(ids.clone()))).collect();
-                        let _ = std::fs::write(directory.join("settled.json"), serde_json::to_string(&object).unwrap_or_default());
-                    }
-                    eprintln!("experts: settled after {CALM_REQUESTS} requests without exchanges (the router wanted {:.1} % outside the pool); this block stays resident (saved as profile \"settled\")", miss * 100.0);
-                }
-            }
-        }
-        let mut status = self.status.lock().unwrap();
-        status.last_swaps = swaps;
-        status.last_miss = miss;
-        status.requests += 1;
-        status.changed_percent = 100.0 * swaps as f64 / slots_total;
-        status.per_layer = per_layer.clone();
-        if mode == Mode::Adapting {
-            eprintln!("experts: the router wanted {:.1} % outside the pool; {swaps} experts exchanged ({:.1} % of the pool changed)", miss * 100.0, status.changed_percent);
-            if self.debug {
-                eprintln!("  debug, per layer: {per_layer:?}");
-            }
-        }
+    fn save_profile(&self, name: &str, block: &Profile) -> Result<Option<std::path::PathBuf>> {
+        let Some(directory) = &self.profiles_dir else { return Ok(None) };
+        let object: serde_json::Map<String, serde_json::Value> = block.iter().map(|(layer, ids)| (layer.to_string(), serde_json::Value::from(ids.clone()))).collect();
+        let path = directory.join(format!("{name}.json"));
+        std::fs::write(&path, serde_json::to_string(&object)?)?;
+        Ok(Some(path))
     }
 
     fn switch_profile(&mut self, name: &str) -> std::result::Result<(), String> {
@@ -473,8 +381,68 @@ impl Worker {
             .expect("at least one slot")
     }
 
-    fn serve(&mut self, job: &Job) -> Result<()> {
+    /// The embeddings of an image: encoded once, then kept for a while. Returns them with their number of tokens and width.
+    fn encode_image(&mut self, bytes: &[u8]) -> Result<(Arc<Vec<f32>>, usize, usize, u64)> {
+        let key = fnv1a(bytes);
+        if let Some(index) = self.image_cache.iter().position(|(cached, _, _)| *cached == key) {
+            let entry = self.image_cache.remove(index);
+            let (embeddings, width) = (entry.1.clone(), entry.2);
+            self.image_cache.push(entry);
+            return Ok((embeddings.clone(), embeddings.len() / width, width, key));
+        }
+        #[cfg(feature = "vision")]
+        {
+            let vision = self.vision.as_ref().context("the engine has no vision projector")?;
+            let started = std::time::Instant::now();
+            let encoded = vision.encode(bytes)?;
+            eprintln!("image: {} soft tokens in {:.0} ms", encoded.tokens, started.elapsed().as_secs_f64() * 1000.0);
+            let embeddings = Arc::new(encoded.embeddings);
+            if self.image_cache.len() >= IMAGE_CACHE {
+                self.image_cache.remove(0);
+            }
+            self.image_cache.push((key, embeddings.clone(), encoded.width));
+            Ok((embeddings, encoded.tokens, encoded.width, key))
+        }
+        #[cfg(not(feature = "vision"))]
+        {
+            let _ = bytes;
+            anyhow::bail!("this build has no vision encoder")
+        }
+    }
+
+    /// The prompt as token ids and the images in it: each image marker becomes as many tokens as the image has soft tokens.
+    fn tokenize(&mut self, job: &Job) -> Result<(Vec<u32>, Vec<ImageRun>)> {
         let ids = self.tokenizer.encode(job.prompt.as_str(), true).map_err(anyhow::Error::msg)?.get_ids().to_vec();
+        if job.images.is_empty() {
+            return Ok((ids, Vec::new()));
+        }
+        anyhow::ensure!(self.vision.is_some(), "this server was started without a vision projector, so it cannot read images (--projector mmproj-....gguf)");
+        let image_token = self.tokenizer.token_to_id("<|image|>").context("the tokenizer does not declare <|image|>")?;
+        let placeholders = ids.iter().filter(|&&token| token == image_token).count();
+        anyhow::ensure!(placeholders == job.images.len(), "the prompt has {placeholders} image markers for {} images", job.images.len());
+        let (mut prompt, mut runs, mut next) = (Vec::with_capacity(ids.len() + 560 * placeholders), Vec::new(), 0);
+        for token in ids {
+            if token != image_token {
+                prompt.push(token);
+                continue;
+            }
+            let (embeddings, tokens, width, key) = self.encode_image(&job.images[next])?;
+            next += 1;
+            let id = IMAGE_TOKEN_FLAG | ((key as u32) & !IMAGE_TOKEN_FLAG);
+            runs.push(ImageRun { start: prompt.len(), len: tokens, width, embeddings });
+            prompt.extend(std::iter::repeat_n(id, tokens));
+        }
+        Ok((prompt, runs))
+    }
+
+    fn serve(&mut self, job: &Job) -> Result<()> {
+        let (ids, runs) = match self.tokenize(job) {
+            Ok(tokenized) => tokenized,
+            Err(error) => {
+                let _ = job.events.send(Event::Failed { code: "invalid_images", message: format!("{error:#}") });
+                return Ok(());
+            }
+        };
         if ids.len() + 1 > self.context {
             let _ = job.events.send(Event::Failed {
                 code: "context_length_exceeded",
@@ -489,7 +457,7 @@ impl Worker {
         self.slots[slot].last_used = self.clock;
         self.slots[slot].history.truncate(reused);
         self.runtime.select_slot(slot);
-        let outcome = self.generate(job, slot, &ids, max_tokens);
+        let outcome = self.generate(job, slot, &ids, &runs, max_tokens);
         eprintln!("request: {} prompt tokens ({reused} reused from conversation {slot}) in {:.1} s", ids.len(), started.elapsed().as_secs_f64());
         if outcome.is_err() {
             self.slots[slot].history.clear();
@@ -497,20 +465,33 @@ impl Worker {
         outcome
     }
 
-    fn generate(&mut self, job: &Job, slot: usize, ids: &[u32], max_tokens: usize) -> Result<()> {
+    fn generate(&mut self, job: &Job, slot: usize, ids: &[u32], runs: &[ImageRun], max_tokens: usize) -> Result<()> {
         let mut cursor = self.slots[slot].history.len();
         while cursor < ids.len() {
             if job.cancel.load(Ordering::Acquire) {
                 self.slots[slot].history.clear();
                 return Ok(());
             }
-            let end = (cursor + READ_SLICE).min(ids.len());
+            // The next image at or after the cursor: text is read up to it, and the image in one piece.
+            let next_image = runs.iter().find(|run| run.start + run.len > cursor);
+            let end = match next_image {
+                Some(run) if run.start == cursor => {
+                    self.runtime.run_image(&run.embeddings, run.width, cursor)?;
+                    let end = cursor + run.len;
+                    self.slots[slot].history.extend_from_slice(&ids[cursor..end]);
+                    cursor = end;
+                    anyhow::ensure!(cursor < ids.len(), "the prompt ends with an image: there is nothing to answer");
+                    continue;
+                }
+                Some(run) => run.start.min(cursor + READ_SLICE),
+                None => (cursor + READ_SLICE).min(ids.len()),
+            };
             self.runtime.prefill(&ids[cursor..end], cursor)?;
             self.slots[slot].history.extend_from_slice(&ids[cursor..end]);
             cursor = end;
         }
         // What the prompt asked of the router tells which experts the answer will want: settle them before decoding.
-        self.adapt(true);
+        self.pool.after_prompt(&mut self.runtime);
         let mut logits = self.runtime.logits();
         let mut sampler = Sampler::new(job.settings.sampling.clone());
         let mut generated: Vec<u32> = Vec::new();

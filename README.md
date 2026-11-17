@@ -9,6 +9,7 @@ experts of every layer still reachable.** The ones the conversation needs are mo
   those experts computes) and the pool is **refilled from the file on disk**, between tokens, by what the router keeps asking for.
 * When the exchange stops being needed (three requests in a row change at most 1 % of the pool) the block is **frozen** and nothing moves any more:
   a specialist for that workload. If the topic changes, it thaws.
+* It **reads images** with a native Metal vision encoder (no framework; `--features vision`, [how it works](docs/vision.md)).
 * A **debug mode** shows which share of the pool was exchanged after the prompt and after each answer, per layer.
 * `dafo-serve` is an OpenAI-compatible server (bearer token, streaming, tools, text attachments) with a chat page; its link carries the token, so nothing has to be typed.
 
@@ -25,6 +26,7 @@ cargo build --release --features host
 | [The expert pool](docs/expert-pool.md) | the technique: router mask + slot indirection; why a mask equals a cut; why mapping the whole file fails on 16 GB |
 | [The adaptive pool](docs/adaptive.md) | exchange by demand, settle, freeze, thaw; the debug mode; an observed run |
 | [Measurements](docs/results.md) | speed (23.8 tok/s with the pool, 24.7 for the cut file), equality with the cut, and a simulation of which experts to keep |
+| [The vision encoder](docs/vision.md) | a native Metal encoder for Gemma 4's projector, checked against a reference (cosine 0.999999) |
 | [How the compiler works](docs/how-it-works.md) | GGUF → graph → passes → Metal plan → runtime |
 | [Run it](docs/run.md) · [Server](docs/SERVER.md) · [Limits](docs/limits.md) | |
 

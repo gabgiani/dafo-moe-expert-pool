@@ -12,6 +12,7 @@ categories = ["science", "hardware-support"]
 [features]
 # The host: tokenizer, chat template, sampling, tools and an OpenAI-compatible server (`dafo-serve`). The compiler itself needs none of it.
 host = ["dep:tokenizers", "dep:serde_json", "dep:tiny_http"]
+vision = ["dep:image"]
 
 [[bin]]
 name = "dafo-serve"
@@ -24,6 +25,7 @@ memmap2 = "0.9"
 tokenizers = { version = "0.23.1", default-features = false, features = ["onig"], optional = true }
 serde_json = { version = "1.0", optional = true }
 tiny_http = { version = "0.12", optional = true }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"], optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"

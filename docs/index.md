@@ -17,6 +17,7 @@ of 48 experts per layer (7.4 GiB) is resident, the router is told which experts 
 | [The expert pool](expert-pool.md) | the technique: router mask + slot indirection, equal to a cut model at every moment |
 | [The adaptive pool](adaptive.md) | exchanging experts by demand, settling on a block, thawing on a topic change; the debug mode |
 | [Measurements](results.md) | speed, equality with the cut model, which policy picks experts best (and the limits of those numbers) |
+| [The vision encoder](vision.md) | a native Metal encoder for Gemma 4's projector: images through the same engine, no framework |
 | [Run it](run.md) | build, compile, serve, chat page and API |
 | [Limits](limits.md) | what is not done, what was not measured |
 

@@ -27,6 +27,10 @@ pub struct Opened {
     pub weights: PathBuf,
     pub context: usize,
     pub tokenizer: Tokenizer,
+    /// The vision projector stored in the folder (`mmproj.gguf`), when it was compiled with one.
+    pub projector: Option<PathBuf>,
+    /// Most soft tokens one image may use.
+    pub visual_tokens: usize,
 }
 
 pub fn is_artifact(path: &Path) -> bool {
@@ -36,7 +40,7 @@ pub fn is_artifact(path: &Path) -> bool {
 /// Writes the folder `directory` for the model at `weights`, compiled for `context` tokens. `copy` makes a copy of the weights
 /// instead of linking them.
 #[cfg(target_os = "macos")]
-pub fn write(directory: &Path, weights: &Path, gguf: &Gguf, plans: &[crate::backend_metal::Plan], context: usize, copy: bool) -> Result<()> {
+pub fn write(directory: &Path, weights: &Path, gguf: &Gguf, plans: &[crate::backend_metal::Plan], context: usize, copy: bool, projector: Option<&Path>) -> Result<()> {
     std::fs::create_dir_all(directory).with_context(|| format!("cannot create {}", directory.display()))?;
     let weights = weights.canonicalize()?;
     let target = directory.join("model.gguf");
@@ -50,6 +54,20 @@ pub fn write(directory: &Path, weights: &Path, gguf: &Gguf, plans: &[crate::back
         "hard link"
     } else {
         link_or_copy(&weights, &target)?
+    };
+    // The vision projector goes beside the weights, linked or copied the same way.
+    let projector_file = match projector {
+        Some(path) => {
+            let path = path.canonicalize().with_context(|| format!("cannot find the projector {}", path.display()))?;
+            let target = directory.join("mmproj.gguf");
+            if copy {
+                std::fs::copy(&path, &target)?;
+            } else if std::fs::hard_link(&path, &target).is_err() {
+                link_or_copy(&path, &target)?;
+            }
+            Some("mmproj.gguf")
+        }
+        None => None,
     };
     let tokenizer = super::tokenizer::from_gguf(gguf)?;
     tokenizer.save(directory.join("tokenizer.json"), false).map_err(anyhow::Error::msg)?;
@@ -69,6 +87,7 @@ pub fn write(directory: &Path, weights: &Path, gguf: &Gguf, plans: &[crate::back
         "tokenizer": "tokenizer.json",
         "kernels": "kernels.metal",
         "chat": "gemma4",
+        "vision": projector_file.map(|file| json!({ "projector": file, "visual_tokens": 560 })),
         "stop_tokens": ["<turn|>", "<|tool_response>"],
     });
     std::fs::write(directory.join("manifest.json"), serde_json::to_string_pretty(&manifest)? + "\n")?;
@@ -104,5 +123,7 @@ pub fn read(directory: &Path) -> Result<Opened> {
         weights,
         context: manifest["context"].as_u64().unwrap_or(16384) as usize,
         tokenizer,
+        projector: manifest["vision"]["projector"].as_str().map(|file| directory.join(file)).filter(|path| path.exists()),
+        visual_tokens: manifest["vision"]["visual_tokens"].as_u64().unwrap_or(560) as usize,
     })
 }

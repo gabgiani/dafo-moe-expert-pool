@@ -48,13 +48,13 @@
   <button id="new">New chat</button>
 </header>
 <details class="system"><summary>System prompt</summary><textarea id="system" placeholder="Optional instructions for the model"></textarea></details>
-<main id="scroll"><div class="thread" id="thread"><div class="empty" id="empty">Write a message (if the page asks for it, paste the API token above).<br>Text files can be attached; images are not supported yet.</div></div></main>
+<main id="scroll"><div class="thread" id="thread"><div class="empty" id="empty">Write a message (if the page asks for it, paste the API token above).<br>Text files and (if the server has a vision projector) images can be attached.</div></div></main>
 <footer>
   <div class="composer">
     <div class="chips" id="chips"></div>
     <div class="row">
-      <button id="attach" title="Attach text files">Attach</button>
-      <input id="file" type="file" multiple hidden accept=".txt,.md,.csv,.json,.xml,.html,.css,.js,.ts,.py,.rs,.go,.java,.c,.h,.cpp,.sql,.yaml,.yml,.toml,.log,.sh,text/*">
+      <button id="attach" title="Attach text files or images">Attach</button>
+      <input id="file" type="file" multiple hidden accept="image/png,image/jpeg,image/webp,.txt,.md,.csv,.json,.xml,.html,.css,.js,.ts,.py,.rs,.go,.java,.c,.h,.cpp,.sql,.yaml,.yml,.toml,.log,.sh,text/*">
       <textarea id="input" rows="1" placeholder="Message (Enter sends, Shift+Enter adds a line)"></textarea>
       <button id="send" class="primary">Send</button>
     </div>
@@ -64,6 +64,7 @@
 const $ = (id) => document.getElementById(id);
 const store = { get(k) { try { return localStorage.getItem(k) || ""; } catch { return ""; } }, set(k, v) { try { localStorage.setItem(k, v); } catch {} } };
 const MAX_FILE = 400000;
+const MAX_IMAGE = 8000000;
 let history = [], attachments = [], controller = null;
 
 // A link with the token (http://host:port/#token=...) fills the field; the token is then removed from the address bar.
@@ -110,7 +111,7 @@ function drawChips() {
   attachments.forEach((file, i) => {
     const chip = document.createElement("span");
     chip.className = "chip";
-    chip.textContent = file.name + " (" + Math.ceil(file.text.length / 1000) + " kB)";
+    chip.textContent = file.name + (file.image ? " (image)" : " (" + Math.ceil(file.text.length / 1000) + " kB)");
     const x = document.createElement("button"); x.textContent = "×"; x.onclick = () => { attachments.splice(i, 1); drawChips(); };
     chip.appendChild(x); $("chips").appendChild(chip);
   });
@@ -118,6 +119,12 @@ function drawChips() {
 $("attach").onclick = () => $("file").click();
 $("file").onchange = async () => {
   for (const file of $("file").files) {
+    if (file.type.startsWith("image/")) {
+      if (file.size > MAX_IMAGE) { add("assistant", "").querySelector(".body").innerHTML = '<span class="error">' + escapeHtml(file.name) + " is larger than " + MAX_IMAGE / 1000000 + " MB.</span>"; continue; }
+      const image = await new Promise((done, fail) => { const r = new FileReader(); r.onload = () => done(r.result); r.onerror = () => fail(r.error); r.readAsDataURL(file); });
+      attachments.push({ name: file.name, image });
+      continue;
+    }
     if (file.size > MAX_FILE) { add("assistant", "").querySelector(".body").innerHTML = '<span class="error">' + escapeHtml(file.name) + " is larger than " + MAX_FILE / 1000 + " kB: the model reads a limited context.</span>"; continue; }
     attachments.push({ name: file.name, text: await file.text() });
   }
@@ -133,10 +140,11 @@ async function send() {
   if (!typed && !attachments.length) return;
   const token = $("token").value.trim();
   let content = typed;
-  for (const file of attachments) content += "\n\n[Attached file: " + file.name + "]\n```\n" + file.text + "\n```";
-  const shown = typed + attachments.map((f) => "\n📎 " + f.name).join("");
+  const images = attachments.filter((f) => f.image);
+  for (const file of attachments) if (!file.image) content += "\n\n[Attached file: " + file.name + "]\n```\n" + file.text + "\n```";
+  const shown = typed + attachments.map((f) => (f.image ? "\n🖼 " : "\n📎 ") + f.name).join("");
   $("input").value = ""; $("input").style.height = "auto"; attachments = []; drawChips();
-  history.push({ role: "user", content: content.trim() });
+  history.push({ role: "user", content: images.length ? [...images.map((f) => ({ type: "image_url", image_url: { url: f.image } })), { type: "text", text: content.trim() || "Describe the image." }] : content.trim() });
   add("user", shown);
   const reply = add("assistant", "");
   const body = reply.querySelector(".body"), stats = reply.querySelector(".stats");

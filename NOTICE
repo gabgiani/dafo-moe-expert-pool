@@ -1,0 +1,9 @@
+dafo-compiler-llm includes code adapted from other projects:
+
+- src/backend_metal/matmul.metal: the matrix-matrix kernels (tiles, simdgroup-matrix products, the indexed form for mixture-of-experts
+  layers and the dequantization functions) are adapted from llama.cpp (https://github.com/ggml-org/llama.cpp), MIT License,
+  Copyright (c) The ggml authors, through the copy in candle-metal-kernels (https://github.com/huggingface/candle, MIT OR Apache-2.0,
+  Hugging Face). Only the tile code and the encodings Gemma 4 needs are kept.
+- The GGUF file format is defined by the ggml project.
+- Gemma is a model of Google, provided under and subject to the Gemma Terms of Use (ai.google.dev/gemma/terms). This repository
+  contains no model weights.

@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__MODEL__ · dafo-serve</title>
+<style>
+  :root { --bg:#fafaf8; --panel:#fff; --fg:#1d1d1b; --muted:#6b6b66; --line:#e3e2dc; --accent:#1f6f5c; --user:#e9f2ef; --code:#f1f0ea; color-scheme: light; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#151614; --panel:#1d1f1c; --fg:#ecebe5; --muted:#9a9a92; --line:#2e302b; --accent:#5cc2a6; --user:#20302b; --code:#262822; color-scheme: dark; } }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.55 -apple-system, "Segoe UI", system-ui, sans-serif; height:100dvh; display:flex; flex-direction:column; }
+  header { display:flex; gap:.75rem; align-items:center; flex-wrap:wrap; padding:.6rem max(16px, env(safe-area-inset-left)); border-bottom:1px solid var(--line); background:var(--panel); }
+  header h1 { font-size:15px; margin:0; font-weight:600; }
+  header .model { color:var(--muted); font-size:13px; }
+  header .spacer { flex:1; }
+  input, textarea, button { font:inherit; color:inherit; }
+  input[type=password], input[type=text] { background:var(--bg); border:1px solid var(--line); border-radius:8px; padding:.35rem .6rem; min-width:0; }
+  button { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:.35rem .8rem; cursor:pointer; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button:disabled { opacity:.5; cursor:default; }
+  details.system { padding:.4rem max(16px, env(safe-area-inset-left)); border-bottom:1px solid var(--line); background:var(--panel); font-size:13px; color:var(--muted); }
+  details.system textarea { width:100%; min-height:3.5rem; margin-top:.4rem; background:var(--bg); border:1px solid var(--line); border-radius:8px; padding:.4rem .6rem; resize:vertical; }
+  main { flex:1; overflow-y:auto; padding:1rem max(16px, env(safe-area-inset-left)); }
+  .thread { max-width:46rem; margin:0 auto; display:flex; flex-direction:column; gap:.9rem; }
+  .msg { padding:.6rem .85rem; border-radius:12px; border:1px solid var(--line); background:var(--panel); white-space:pre-wrap; overflow-wrap:anywhere; }
+  .msg.user { background:var(--user); align-self:flex-end; max-width:88%; }
+  .msg .who { font-size:11px; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); margin-bottom:.15rem; }
+  .msg pre { background:var(--code); border-radius:8px; padding:.6rem .75rem; overflow-x:auto; margin:.5rem 0; white-space:pre; font:13px/1.45 ui-monospace, Menlo, monospace; }
+  .msg code { font:13px ui-monospace, Menlo, monospace; background:var(--code); border-radius:4px; padding:0 .25em; }
+  .msg pre code { padding:0; background:none; }
+  .stats { font-size:12px; color:var(--muted); margin-top:.3rem; }
+  .empty { color:var(--muted); text-align:center; margin-top:18vh; }
+  footer { border-top:1px solid var(--line); background:var(--panel); padding:.6rem max(16px, env(safe-area-inset-left)) calc(.6rem + env(safe-area-inset-bottom, 0px)); }
+  .composer { max-width:46rem; margin:0 auto; display:flex; flex-direction:column; gap:.4rem; }
+  .chips { display:flex; flex-wrap:wrap; gap:.35rem; }
+  .chip { font-size:12px; background:var(--code); border-radius:999px; padding:.1rem .6rem; }
+  .chip button { border:0; background:none; padding:0 0 0 .35rem; color:var(--muted); }
+  .row { display:flex; gap:.5rem; align-items:flex-end; }
+  .row textarea { flex:1; min-height:2.6rem; max-height:40vh; resize:none; background:var(--bg); border:1px solid var(--line); border-radius:10px; padding:.5rem .7rem; }
+  .error { color:#b3261e; }
+</style>
+</head>
+<body>
+<header>
+  <h1>dafo-serve</h1><span class="model" id="model">__MODEL__</span><span class="model" id="ctx"></span><span class="model" id="experts" hidden></span>
+  <span class="spacer"></span>
+  <input id="token" type="password" placeholder="API token" autocomplete="off" aria-label="API token">
+  <button id="new">New chat</button>
+</header>
+<details class="system"><summary>System prompt</summary><textarea id="system" placeholder="Optional instructions for the model"></textarea></details>
+<main id="scroll"><div class="thread" id="thread"><div class="empty" id="empty">Write a message (if the page asks for it, paste the API token above).<br>Text files can be attached; images are not supported yet.</div></div></main>
+<footer>
+  <div class="composer">
+    <div class="chips" id="chips"></div>
+    <div class="row">
+      <button id="attach" title="Attach text files">Attach</button>
+      <input id="file" type="file" multiple hidden accept=".txt,.md,.csv,.json,.xml,.html,.css,.js,.ts,.py,.rs,.go,.java,.c,.h,.cpp,.sql,.yaml,.yml,.toml,.log,.sh,text/*">
+      <textarea id="input" rows="1" placeholder="Message (Enter sends, Shift+Enter adds a line)"></textarea>
+      <button id="send" class="primary">Send</button>
+    </div>
+  </div>
+</footer>
+<script>
+const $ = (id) => document.getElementById(id);
+const store = { get(k) { try { return localStorage.getItem(k) || ""; } catch { return ""; } }, set(k, v) { try { localStorage.setItem(k, v); } catch {} } };
+const MAX_FILE = 400000;
+let history = [], attachments = [], controller = null;
+
+// A link with the token (http://host:port/#token=...) fills the field; the token is then removed from the address bar.
+try {
+  const given = new URLSearchParams(location.hash.slice(1)).get("token") || new URLSearchParams(location.search).get("token");
+  if (given) { store.set("dafo-token", given.trim()); history.replaceState(null, "", location.pathname); }
+} catch {}
+$("token").value = store.get("dafo-token");
+$("token").addEventListener("input", () => store.set("dafo-token", $("token").value.trim()));
+$("system").value = store.get("dafo-system");
+$("system").addEventListener("input", () => store.set("dafo-system", $("system").value));
+function showExperts() {
+  const token = $("token").value.trim();
+  if (!token) return;
+  fetch("/v1/experts", { headers: { Authorization: "Bearer " + token } }).then((r) => r.ok ? r.json() : null).then((e) => {
+    if (!e || e.mode === undefined) return;
+    $("experts").hidden = false;
+    $("experts").textContent = "experts: " + e.mode + (e.requests ? " · " + e.prefill_changed_percent.toFixed(1) + " % of the pool changed after the prompt, " + e.changed_percent.toFixed(1) + " % after the answer · " + (e.last_miss * 100).toFixed(1) + " % wanted outside" : "");
+  }).catch(() => {});
+}
+showExperts();
+fetch("/health").then((r) => r.json()).then((h) => { $("ctx").textContent = h.context + " tokens of context"; }).catch(() => {});
+
+function escapeHtml(s) { return s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c])); }
+function render(text) {
+  const parts = text.split(/```/);
+  return parts.map((part, i) => {
+    if (i % 2 === 1) { const body = part.replace(/^[^\n]*\n/, ""); return "<pre><code>" + escapeHtml(body.replace(/\n$/, "")) + "</code></pre>"; }
+    return escapeHtml(part).replace(/`([^`\n]+)`/g, "<code>$1</code>");
+  }).join("");
+}
+function add(role, text) {
+  $("empty")?.remove();
+  const el = document.createElement("div");
+  el.className = "msg " + role;
+  el.innerHTML = '<div class="who">' + (role === "user" ? "You" : "Model") + '</div><div class="body"></div><div class="stats"></div>';
+  el.querySelector(".body").innerHTML = render(text);
+  $("thread").appendChild(el);
+  $("scroll").scrollTop = $("scroll").scrollHeight;
+  return el;
+}
+function drawChips() {
+  $("chips").innerHTML = "";
+  attachments.forEach((file, i) => {
+    const chip = document.createElement("span");
+    chip.className = "chip";
+    chip.textContent = file.name + " (" + Math.ceil(file.text.length / 1000) + " kB)";
+    const x = document.createElement("button"); x.textContent = "×"; x.onclick = () => { attachments.splice(i, 1); drawChips(); };
+    chip.appendChild(x); $("chips").appendChild(chip);
+  });
+}
+$("attach").onclick = () => $("file").click();
+$("file").onchange = async () => {
+  for (const file of $("file").files) {
+    if (file.size > MAX_FILE) { add("assistant", "").querySelector(".body").innerHTML = '<span class="error">' + escapeHtml(file.name) + " is larger than " + MAX_FILE / 1000 + " kB: the model reads a limited context.</span>"; continue; }
+    attachments.push({ name: file.name, text: await file.text() });
+  }
+  $("file").value = ""; drawChips();
+};
+$("new").onclick = () => { if (controller) controller.abort(); history = []; attachments = []; drawChips(); $("thread").innerHTML = '<div class="empty" id="empty">New chat.</div>'; };
+$("input").addEventListener("input", () => { const t = $("input"); t.style.height = "auto"; t.style.height = Math.min(t.scrollHeight, window.innerHeight * 0.4) + "px"; });
+$("input").addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } });
+$("send").onclick = () => (controller ? controller.abort() : send());
+
+async function send() {
+  const typed = $("input").value.trim();
+  if (!typed && !attachments.length) return;
+  const token = $("token").value.trim();
+  let content = typed;
+  for (const file of attachments) content += "\n\n[Attached file: " + file.name + "]\n```\n" + file.text + "\n```";
+  const shown = typed + attachments.map((f) => "\n📎 " + f.name).join("");
+  $("input").value = ""; $("input").style.height = "auto"; attachments = []; drawChips();
+  history.push({ role: "user", content: content.trim() });
+  add("user", shown);
+  const reply = add("assistant", "");
+  const body = reply.querySelector(".body"), stats = reply.querySelector(".stats");
+  const system = $("system").value.trim();
+  const messages = (system ? [{ role: "system", content: system }] : []).concat(history);
+  controller = new AbortController(); $("send").textContent = "Stop";
+  let answer = "", usage = null, started = performance.now(), first = null;
+  try {
+    const response = await fetch("/v1/chat/completions", {
+      method: "POST", signal: controller.signal,
+      headers: { "Content-Type": "application/json", Authorization: "Bearer " + token },
+      body: JSON.stringify({ messages, stream: true, stream_options: { include_usage: true } }),
+    });
+    if (!response.ok) { const e = await response.json().catch(() => ({})); throw new Error(e.error?.message || response.status + " " + response.statusText); }
+    const reader = response.body.getReader(), decoder = new TextDecoder();
+    let buffer = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let at;
+      while ((at = buffer.indexOf("\n\n")) >= 0) {
+        const line = buffer.slice(0, at).trim(); buffer = buffer.slice(at + 2);
+        if (!line.startsWith("data:") || line.includes("[DONE]")) continue;
+        const event = JSON.parse(line.slice(5));
+        if (event.error) throw new Error(event.error.message);
+        if (event.usage) usage = event.usage;
+        const piece = event.choices?.[0]?.delta?.content;
+        if (piece) { if (first === null) first = performance.now(); answer += piece; body.innerHTML = render(answer); $("scroll").scrollTop = $("scroll").scrollHeight; }
+      }
+    }
+    if (usage) { const seconds = (performance.now() - (first ?? started)) / 1000; stats.textContent = usage.prompt_tokens + " prompt tokens · " + usage.completion_tokens + " generated" + (seconds > 0.2 && usage.completion_tokens > 1 ? " · " + (usage.completion_tokens / seconds).toFixed(1) + " tok/s" : ""); }
+    history.push({ role: "assistant", content: answer });
+    showExperts();
+  } catch (error) {
+    if (error.name === "AbortError") { stats.textContent = "stopped"; if (answer) history.push({ role: "assistant", content: answer }); else history.pop(); }
+    else { body.innerHTML = '<span class="error">' + escapeHtml(String(error.message || error)) + "</span>"; history.pop(); }
+  } finally { controller = null; $("send").textContent = "Send"; }
+}
+</script>
+</body>
+</html>

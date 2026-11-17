@@ -1,0 +1,252 @@
+--- a/tools/server/server.cpp	2026-11-14 12:10:17
++++ b/tools/server/server.cpp	2026-11-14 17:02:53
+@@ -13,7 +13,16 @@
+ #include "llama.h"
+ #include "log.h"
+ 
++#include <algorithm>
++#include <chrono>
++#include <map>
++#include <string>
++#include <sys/stat.h>
+ #include <atomic>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <vector>
+ #include <clocale>
+ #include <exception>
+ #include <signal.h>
+@@ -767,8 +776,212 @@
+     }
+ 
+     GGML_ABORT("invalid server role");
++}
++
++// DAFO: appends, for every MoE layer evaluation, a record {int32 layer, int32 n_tokens, int32 -n_used} followed, for
++// each token, by n_used bytes (ids of the experts with the highest router probability, in order) and n_used float32
++// (their probabilities, before the renormalization among the chosen ones). A negative n_used marks this format.
++static FILE * moe_trace_file = nullptr;
++static int    moe_trace_used = 8;
++// DAFO: expert mask (LLAMA_MOE_MASK=<file>). Each line "<layer> <id> <id> ..." lists the experts the router of that
++// layer may choose; a layer without a line keeps them all. The file is read again when it changes, so a selection can
++// be tried on the full model without building a pruned GGUF. The excluded experts get a very negative logit: the
++// top-k and the renormalization among the chosen ones then work as in the pruned model.
++static const char * moe_mask_path = nullptr;
++static std::vector<std::vector<uint8_t>> moe_mask; // [layer][expert] = 1 if allowed; empty layer = all allowed
++static long long moe_mask_stamp = -1;
++static void moe_mask_reload() {
++    struct stat st;
++    if (moe_mask_path == nullptr || stat(moe_mask_path, &st) != 0) {
++        moe_mask.clear();
++        moe_mask_stamp = -1;
++        return;
++    }
++    const long long stamp = (long long) st.st_mtime * 1000003LL + (long long) st.st_size;
++    if (stamp == moe_mask_stamp) {
++        return;
++    }
++    moe_mask_stamp = stamp;
++    moe_mask.clear();
++    FILE * f = std::fopen(moe_mask_path, "r");
++    if (f == nullptr) {
++        return;
++    }
++    char line[8192];
++    while (std::fgets(line, sizeof(line), f)) {
++        char * cursor = line;
++        char * end    = nullptr;
++        const long layer = std::strtol(cursor, &end, 10);
++        if (end == cursor || layer < 0 || layer > 1023) {
++            continue;
++        }
++        if ((size_t) layer >= moe_mask.size()) {
++            moe_mask.resize(layer + 1);
++        }
++        moe_mask[layer].assign(256, 0);
++        cursor = end;
++        while (true) {
++            const long id = std::strtol(cursor, &end, 10);
++            if (end == cursor) {
++                break;
++            }
++            if (id >= 0 && id < 256) {
++                moe_mask[layer][id] = 1;
++            }
++            cursor = end;
++        }
++    }
++    std::fclose(f);
++}
++
++// true if the tensor is exactly "<prefix><layer>": llama.cpp also names views of it, like "<prefix><layer> (reshaped)",
++// which have another shape and must be left alone
++static bool moe_named(const struct ggml_tensor * t, const char * prefix, size_t n) {
++    if (std::strncmp(t->name, prefix, n) != 0) {
++        return false;
++    }
++    const char * rest = t->name + n;
++    if (*rest == 0) {
++        return false;
++    }
++    while (*rest >= '0' && *rest <= '9') {
++        rest++;
++    }
++    return *rest == 0;
++}
++
++// DAFO: profile (LLAMA_MOE_PROFILE=<file>). Times every node of the graph (the scheduler synchronizes the backend before
++// the callback, so GPU nodes are timed too) and the gaps between nodes (copies between GPU and CPU and scheduling).
++// Totals are kept apart for single-token evaluations (generation) and batches (prompt). The file is rewritten as
++// lines "<mode> <evaluations> <seconds> <count> <op> <name without the layer>" at the start of each evaluation.
++static const char * moe_prof_path = nullptr;
++struct moe_prof_entry { double seconds = 0; long count = 0; };
++static std::map<std::string, moe_prof_entry> moe_prof[2];
++static long moe_prof_evals[2] = { 0, 0 };
++static int  moe_prof_mode = 1;
++static std::chrono::steady_clock::time_point moe_prof_mark;
++static bool moe_prof_started = false;
++static void moe_prof_dump() {
++    FILE * f = std::fopen(moe_prof_path, "w");
++    if (f == nullptr) {
++        return;
++    }
++    for (int mode = 0; mode < 2; ++mode) {
++        for (const auto & it : moe_prof[mode]) {
++            std::fprintf(f, "%s %ld %.6f %ld %s\n", mode == 0 ? "gen" : "batch", moe_prof_evals[mode], it.second.seconds, it.second.count, it.first.c_str());
++        }
++    }
++    std::fclose(f);
++}
++static bool moe_prof_cb(struct ggml_tensor * t, bool ask) {
++    const auto now = std::chrono::steady_clock::now();
++    if (ask) {
++        // an evaluation is counted at the router of layer 0 (its shape tells generation from prompt batches); the few
++        // nodes before it are booked to the previous evaluation, which is of the same kind almost always
++        if (std::strcmp(t->name, "ffn_moe_logits-0") == 0) {
++            moe_prof_mode = t->ne[1] == 1 ? 0 : 1;
++            moe_prof_evals[moe_prof_mode]++;
++            if (moe_prof_evals[0] % 16 == 0) {
++                moe_prof_dump();
++            }
++        }
++        if (!moe_prof_started) {
++            moe_prof_started = true;
++        } else {
++            auto & gap = moe_prof[moe_prof_mode]["- (between nodes: GPU<->CPU copies, scheduling)"];
++            gap.seconds += std::chrono::duration<double>(now - moe_prof_mark).count();
++            gap.count++;
++        }
++        moe_prof_mark = now;
++        return true;
++    }
++    std::string name = t->name;
++    const size_t paren = name.find(" (");
++    if (paren != std::string::npos) {
++        name = name.substr(0, paren) + "~";
++    }
++    size_t end = name.size();
++    const bool tilde = end > 0 && name[end - 1] == '~';
++    if (tilde) { end--; }
++    size_t digits = end;
++    while (digits > 0 && name[digits - 1] >= '0' && name[digits - 1] <= '9') { digits--; }
++    if (digits > 0 && digits < end && (name[digits - 1] == '-' || name[digits - 1] == '_')) {
++        name = name.substr(0, digits - 1) + (tilde ? "~" : "");
++    }
++    auto & entry = moe_prof[moe_prof_mode][std::string(ggml_op_name(t->op)) + " " + name];
++    entry.seconds += std::chrono::duration<double>(now - moe_prof_mark).count();
++    entry.count++;
++    moe_prof_mark = std::chrono::steady_clock::now();
++    return true;
+ }
+ 
++static bool moe_trace_cb(struct ggml_tensor * t, bool ask, void *) {
++    if (moe_prof_path != nullptr) {
++        return moe_prof_cb(t, ask);
++    }
++    if (moe_mask_path != nullptr && moe_named(t, "ffn_moe_logits-", 15)) {
++        if (ask) {
++            return true;
++        }
++        const int32_t il = std::atoi(t->name + 15);
++        if (il == 0) {
++            moe_mask_reload();
++        }
++        if ((size_t) il < moe_mask.size() && !moe_mask[il].empty() && t->type == GGML_TYPE_F32) {
++            const int64_t n_expert = t->ne[0];
++            const int64_t n_tokens = t->ne[1];
++            std::vector<float> logits(n_expert * n_tokens);
++            ggml_backend_tensor_get(t, logits.data(), 0, logits.size() * sizeof(float));
++            for (int64_t i = 0; i < n_tokens; ++i) {
++                for (int64_t e = 0; e < n_expert; ++e) {
++                    if (e >= 256 || !moe_mask[il][e]) {
++                        logits[i * n_expert + e] = -1e30f;
++                    }
++                }
++            }
++            ggml_backend_tensor_set(t, logits.data(), 0, logits.size() * sizeof(float));
++        }
++        return true;
++    }
++    if (moe_trace_file == nullptr || !moe_named(t, "ffn_moe_probs-", 14)) {
++        return !ask;
++    }
++    if (ask) {
++        return true;
++    }
++    if (t->type != GGML_TYPE_F32 || t->ne[0] < moe_trace_used) {
++        return true;
++    }
++    const int32_t il       = std::atoi(t->name + 14);
++    const int64_t n_expert = t->ne[0];
++    const int64_t n_tokens = t->ne[1];
++    const int32_t n_used   = moe_trace_used;
++    std::vector<float> probs(n_expert * n_tokens);
++    ggml_backend_tensor_get(t, probs.data(), 0, probs.size() * sizeof(float));
++    const int32_t head[3] = { il, (int32_t) n_tokens, -n_used };
++    std::fwrite(head, sizeof(int32_t), 3, moe_trace_file);
++    std::vector<int32_t> order(n_expert);
++    std::vector<uint8_t> ids(n_used);
++    std::vector<float>   weights(n_used);
++    for (int64_t i = 0; i < n_tokens; ++i) {
++        const float * row = probs.data() + i * n_expert;
++        for (int64_t e = 0; e < n_expert; ++e) {
++            order[e] = (int32_t) e;
++        }
++        std::partial_sort(order.begin(), order.begin() + n_used, order.end(), [row](int32_t a, int32_t b) { return row[a] > row[b]; });
++        for (int32_t k = 0; k < n_used; ++k) {
++            ids[k]     = (uint8_t) order[k];
++            weights[k] = row[order[k]];
++        }
++        std::fwrite(ids.data(), 1, n_used, moe_trace_file);
++        std::fwrite(weights.data(), sizeof(float), n_used, moe_trace_file);
++    }
++    if (il == 0) {
++        std::fflush(moe_trace_file);
++    }
++    return true;
++}
++
+ int llama_server(int argc, char ** argv) {
+     server_role role;
+ 
+@@ -792,6 +1005,19 @@
+         return 1;
+     }
+ 
++    // DAFO: trace of the experts each MoE layer selects (LLAMA_MOE_TRACE=<file>), to profile a workload
++    moe_mask_path = std::getenv("LLAMA_MOE_MASK");
++    if (const char * trace = std::getenv("LLAMA_MOE_TRACE")) {
++        moe_trace_file = std::fopen(trace, "ab");
++    }
++    if (const char * used = std::getenv("LLAMA_MOE_USED")) {
++        moe_trace_used = std::atoi(used);
++    }
++    moe_prof_path = std::getenv("LLAMA_MOE_PROFILE");
++    if (moe_trace_file != nullptr || moe_mask_path != nullptr || moe_prof_path != nullptr) {
++        params.cb_eval = moe_trace_cb;
++    }
++
+     SRV_INF("%s", "initializing ...\n");
+ 
+     llama_backend_init();

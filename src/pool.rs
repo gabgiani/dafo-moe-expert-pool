@@ -199,7 +199,9 @@ impl AdaptivePool {
                         }
                     }
                     if changed > 0 {
-                        let ids: Vec<usize> = next.into_iter().collect();
+                        // Hottest first: a runtime with two tiers of experts puts the first ones in the faster tier.
+                        let mut ids: Vec<usize> = next.into_iter().collect();
+                        ids.sort_by(|a, b| self.score[layer][*b].partial_cmp(&self.score[layer][*a]).unwrap());
                         if runtime.set_allowed_experts(layer, &ids, total).is_ok() {
                             swaps += changed;
                             per_layer[layer] = changed;

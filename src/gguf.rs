@@ -238,17 +238,22 @@ impl Gguf {
     /// Tells the system the pages of `[offset, offset + len)` of the mapped file will be read soon (`keep`) or are not needed and may
     /// leave memory (they are read again from the file if touched). Only whole pages inside the range are affected.
     pub fn advise(&self, offset: usize, len: usize, keep: bool) {
-        let page = 16384usize;
-        let start = offset.div_ceil(page) * page;
-        let end = ((offset + len) / page * page).min(self.map.len());
-        if end > start {
-            if keep {
-                let _ = self.map.advise_range(memmap2::Advice::WillNeed, start, end - start);
-            } else {
-                // A read-only private mapping of a file: dropped pages are read again from the file when touched.
-                let _ = unsafe { self.map.unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, start, end - start) };
+        #[cfg(unix)]
+        {
+            let page = 16384usize;
+            let start = offset.div_ceil(page) * page;
+            let end = ((offset + len) / page * page).min(self.map.len());
+            if end > start {
+                if keep {
+                    let _ = self.map.advise_range(memmap2::Advice::WillNeed, start, end - start);
+                } else {
+                    // A read-only private mapping of a file: dropped pages are read again from the file when touched.
+                    let _ = unsafe { self.map.unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, start, end - start) };
+                }
             }
         }
+        #[cfg(not(unix))]
+        let _ = (offset, len, keep);
     }
 
     pub fn mapped(&self) -> &[u8] {

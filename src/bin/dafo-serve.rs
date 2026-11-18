@@ -13,13 +13,13 @@
 //!
 //! Without --token (or DAFO_SERVE_TOKEN) a random token is made and printed at start.
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
 fn main() {
-    eprintln!("dafo-serve needs a Mac: the first backend targets Metal");
+    eprintln!("dafo-serve needs a Mac (Metal) or an NVIDIA GPU (CUDA)");
     std::process::exit(1);
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 fn main() {
     if let Err(error) = server::run() {
         eprintln!("dafo-serve: {error:#}");
@@ -27,7 +27,7 @@ fn main() {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 mod server {
     use std::collections::HashSet;
     use std::io::Read;
@@ -57,7 +57,7 @@ mod server {
     }
 
     fn usage() -> &'static str {
-        "usage: dafo-serve MODEL.dafo|MODEL.gguf [--host H] [--port P] [--token T] [--context TOKENS] [--slots N] [--pool EXPERTS [--profile FILE] [--profiles DIR] [--adaptive] [--debug]] [--projector FILE [--visual-tokens N]] [--open]"
+        "usage: dafo-serve MODEL.dafo|MODEL.gguf [--host H] [--port P] [--token T] [--context TOKENS] [--slots N] [--pool EXPERTS [--vram-experts N] [--profile FILE] [--profiles DIR] [--adaptive] [--debug]] [--projector FILE [--visual-tokens N]] [--open]"
     }
 
     fn option(arguments: &[String], name: &str) -> Result<Option<String>> {
@@ -98,7 +98,7 @@ mod server {
         eprintln!("compiling {} for {context} tokens of context, {slots} conversations in cache ...", weights.display());
         let started = std::time::Instant::now();
         let pool = match option(&arguments, "--pool")? {
-            Some(size) => Some(dafo_compiler_llm::host::engine::PoolConfig { size: size.parse()?, profile: option(&arguments, "--profile")?.map(Into::into), profiles_dir: option(&arguments, "--profiles")?.map(Into::into), adaptive: arguments.iter().any(|argument| argument == "--adaptive"), debug: arguments.iter().any(|argument| argument == "--debug") }),
+            Some(size) => Some(dafo_compiler_llm::host::engine::PoolConfig { size: size.parse()?, device_experts: option(&arguments, "--vram-experts")?.map(|value| value.parse()).transpose()?, profile: option(&arguments, "--profile")?.map(Into::into), profiles_dir: option(&arguments, "--profiles")?.map(Into::into), adaptive: arguments.iter().any(|argument| argument == "--adaptive"), debug: arguments.iter().any(|argument| argument == "--debug") }),
             None => None,
         };
         let projector: Option<std::path::PathBuf> = match option(&arguments, "--projector")? {

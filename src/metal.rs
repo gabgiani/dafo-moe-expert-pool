@@ -66,6 +66,11 @@ impl Gpu {
             .with_context(|| format!("cannot allocate a buffer of {bytes} bytes"))
     }
 
+    /// A buffer the host reads and writes too (on Metal every buffer is: memory is shared).
+    pub fn buffer_shared(&self, bytes: usize) -> Result<Buffer> {
+        self.buffer(bytes)
+    }
+
     pub fn buffer_from<T: Copy>(&self, values: &[T]) -> Result<Buffer> {
         let mut buffer = self.buffer(size_of_val(values))?;
         buffer.as_mut_slice::<T>()[..values.len()].copy_from_slice(values);
@@ -132,6 +137,23 @@ impl Buffer {
     pub fn as_slice<T: Copy>(&self) -> &[T] {
         // The buffer is shared storage owned by `self`; its contents live as long as it does.
         unsafe { std::slice::from_raw_parts(self.0.contents().as_ptr().cast::<T>(), self.bytes() / size_of::<T>()) }
+    }
+
+    /// A copy of the contents (the GPU must be idle).
+    pub fn to_vec<T: Copy>(&self) -> Vec<T> {
+        self.as_slice::<T>().to_vec()
+    }
+
+    /// A copy of `length` bytes from `offset` (the GPU must be idle).
+    pub fn read_bytes(&self, offset: usize, length: usize) -> Vec<u8> {
+        self.as_slice::<u8>()[offset..offset + length].to_vec()
+    }
+
+    /// Writes `data` at `offset` bytes into the buffer (the GPU must be idle).
+    pub fn write_bytes(&mut self, offset: usize, data: &[u8]) -> Result<()> {
+        anyhow::ensure!(offset + data.len() <= self.bytes(), "a write of {} bytes at {offset} does not fit a buffer of {}", data.len(), self.bytes());
+        self.as_mut_slice::<u8>()[offset..offset + data.len()].copy_from_slice(data);
+        Ok(())
     }
 
     pub fn as_mut_slice<T: Copy>(&mut self) -> &mut [T] {

@@ -10,7 +10,10 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 
 use crate::backend_metal::{self, Arg, MAX_BATCH, Plan, STATE_TOKENS, STATE_VISION, STATE_WORDS, VISION_BATCH};
 use crate::gguf::Gguf;
-use crate::metal::{Buffer, Gpu, Kernel, Timing};
+#[cfg(target_os = "macos")]
+use crate::metal::{Buffer, Encoder, Gpu, Kernel, Timing};
+#[cfg(not(target_os = "macos"))]
+use crate::cuda::{Buffer, Encoder, Gpu, Kernel, Timing};
 
 const PAGE: usize = 16384;
 /// Weight buffers are made of at most this many bytes of the mapped file.
@@ -127,20 +130,32 @@ pub struct Runtime {
     weight_bytes: usize,
     /// Experts resident per layer when the runtime was built with an expert pool.
     pool: Option<Pool>,
+    /// Expert slots in device memory (the others are in host memory); u32::MAX when all are.
+    device_slots: u32,
     /// The mapped file the weight buffers point into; declared last so it is dropped after them.
     _gguf: Arc<Gguf>,
 }
 
 /// The experts of each layer that sit in the pool: buffers of `size` experts for the two expert tensors of every layer.
 struct Pool {
+    /// Experts per layer in all: `device` slots in device memory followed by the rest in pinned host memory.
     size: usize,
-    /// Per layer: the weight buffer indices of `ffn_gate_up_exps` and `ffn_down_exps`, their bytes per expert, and which expert holds each slot.
+    device: usize,
+    /// Per layer: where `ffn_gate_up_exps` and `ffn_down_exps` live, and which expert holds each slot.
     layers: Vec<PoolLayer>,
 }
 
+/// One expert tensor of a layer in the pool: the weight buffer of its device slots, that of its host slots (if any) and the bytes of an expert.
+#[derive(Clone, Copy)]
+struct Tier {
+    device: usize,
+    host: Option<usize>,
+    stride: usize,
+}
+
 struct PoolLayer {
-    gate_up: (usize, usize),
-    down: (usize, usize),
+    gate_up: Tier,
+    down: Tier,
     slots: Vec<Option<usize>>,
     total: usize,
 }
@@ -168,6 +183,15 @@ impl Runtime {
     /// `backend_metal::use_expert_pool(graph, n)`. The memory the experts take is then `n` of the model's experts per layer, whatever
     /// their number in the file: the model is the full one on disk and a cut in memory.
     pub fn with_expert_pool(gguf: &Arc<Gguf>, plans: &[Plan], slots: usize, pool: Option<usize>) -> Result<Self> {
+        Self::with_expert_tiers(gguf, plans, slots, pool.map(|size| (size, 0)))
+    }
+
+    /// Like [`Runtime::with_expert_pool`] with two places for the experts: `(device, host)` slots per layer, the first in device memory and
+    /// the rest in pinned host memory the GPU reads over PCIe (CUDA only; the plans must be compiled for a pool of `device + host`).
+    /// The experts of the file that are in neither stay on disk (mapped) until the host asks for them.
+    pub fn with_expert_tiers(gguf: &Arc<Gguf>, plans: &[Plan], slots: usize, tiers: Option<(usize, usize)>) -> Result<Self> {
+        let pool = tiers.map(|(device, host)| device + host);
+        let device_slots = tiers.map_or(u32::MAX, |(device, host)| if host == 0 { u32::MAX } else { device as u32 });
         ensure!(!plans.is_empty() && plans[0].batch == 1, "the first plan must take one token");
         ensure!(slots >= 1, "at least one slot");
         for plan in plans {
@@ -207,9 +231,11 @@ impl Runtime {
         spans.sort();
         let limit = MAX_WEIGHT_BUFFER.min(gpu.max_buffer_bytes());
         let map = gguf.mapped();
-        let mapped_end = round_up(map.len());
+        // Metal wraps whole pages (the tail of the last page of the file is readable); a copy to another device must stop at the end of the file.
+        let mapped_end = if cfg!(target_os = "macos") { round_up(map.len()) } else { map.len() };
         let mut buffers = Vec::new();
         let mut location: HashMap<&str, (usize, usize)> = HashMap::new();
+        let mut host_location: HashMap<&str, usize> = HashMap::new();
         let mut weight_bytes = 0;
         let mut index = 0;
         while index < spans.len() {
@@ -245,20 +271,29 @@ impl Runtime {
                 ensure!(size >= 1 && size <= total, "the pool of {size} experts does not fit a tensor of {total}");
                 let stride = tensor.bytes() / total;
                 let layer: usize = name.split('.').nth(1).and_then(|part| part.parse().ok()).with_context(|| format!("cannot read the layer of {name}"))?;
+                let (device_count, host_count) = tiers.expect("a pool has tiers");
                 while layers.len() <= layer {
-                    layers.push(PoolLayer { gate_up: (usize::MAX, 0), down: (usize::MAX, 0), slots: vec![None; size], total });
+                    let empty = Tier { device: usize::MAX, host: None, stride: 0 };
+                    layers.push(PoolLayer { gate_up: empty, down: empty, slots: vec![None; size], total });
                 }
-                let index = buffers.len();
-                buffers.push(gpu.buffer(size * stride)?);
-                location.insert(name.as_str(), (index, 0));
-                weight_bytes += size * stride;
+                let device_index = buffers.len();
+                buffers.push(gpu.buffer(device_count * stride)?);
+                location.insert(name.as_str(), (device_index, 0));
+                weight_bytes += device_count * stride;
+                let mut host_index = None;
+                if host_count > 0 {
+                    host_index = Some(buffers.len());
+                    buffers.push(gpu.buffer_shared(host_count * stride)?);
+                    host_location.insert(name.as_str(), buffers.len() - 1);
+                }
+                let tier = Tier { device: device_index, host: host_index, stride };
                 if name.contains("gate_up") {
-                    layers[layer].gate_up = (index, stride);
+                    layers[layer].gate_up = tier;
                 } else {
-                    layers[layer].down = (index, stride);
+                    layers[layer].down = tier;
                 }
             }
-            pool_state = Some(Pool { size, layers });
+            pool_state = Some(Pool { size, device: tiers.map_or(size, |(device, _)| device), layers });
         }
 
         let mut caches = Vec::new();
@@ -269,10 +304,10 @@ impl Runtime {
             }
             caches.push(slot);
         }
-        let state = gpu.buffer(STATE_WORDS * 4)?;
-        let demand = gpu.buffer(backend_metal::MAX_EXPERT_LAYERS * backend_metal::EXPERT_MASK_STRIDE * 4)?;
+        let state = gpu.buffer_shared(STATE_WORDS * 4)?;
+        let demand = gpu.buffer_shared(backend_metal::MAX_EXPERT_LAYERS * backend_metal::EXPERT_MASK_STRIDE * 4)?;
 
-        let access = backend_metal::kernel_buffer_access(&plans[0].source);
+        let access = if cfg!(target_os = "macos") { backend_metal::kernel_buffer_access(&plans[0].source) } else { HashMap::new() };
         let mut programs = Vec::new();
         for plan in plans {
             let vision = plan.batch > MAX_BATCH;
@@ -298,6 +333,14 @@ impl Runtime {
                             let &(buffer, offset) = location.get(name.as_str()).ok_or_else(|| anyhow!("weight {name} has no buffer"))?;
                             Bound::Buffer(Which::Weight(buffer), offset)
                         }
+                        Arg::WeightHost(name) => {
+                            let buffer = match host_location.get(name.as_str()) {
+                                Some(&buffer) => buffer,
+                                None => location.get(name.as_str()).ok_or_else(|| anyhow!("weight {name} has no buffer"))?.0,
+                            };
+                            Bound::Buffer(Which::Weight(buffer), 0)
+                        }
+                        Arg::DeviceSlots => Bound::U32(device_slots),
                         Arg::CacheKey(layer) => Bound::Buffer(Which::CacheKey(*layer), 0),
                         Arg::CacheValue(layer) => Bound::Buffer(Which::CacheValue(*layer), 0),
                         Arg::Table(table) => Bound::Buffer(Which::Table(*table), 0),
@@ -338,7 +381,7 @@ impl Runtime {
         }
         // Batch plans largest first, after the one-token plan.
         programs[1..].sort_by(|a, b| b.batch.cmp(&a.batch));
-        let mut runtime = Self { gpu, kernels, kernel_names, programs, weights: buffers, caches, slot: 0, state, demand, extra: None, weight_bytes, pool: pool_state, _gguf: gguf.clone() };
+        let mut runtime = Self { gpu, kernels, kernel_names, programs, weights: buffers, caches, slot: 0, state, demand, extra: None, weight_bytes, pool: pool_state, device_slots, _gguf: gguf.clone() };
         if let Some(pool) = &runtime.pool {
             // Until the host chooses, each layer holds its first experts.
             let (size, layers) = (pool.size, pool.layers.len());
@@ -390,30 +433,74 @@ impl Runtime {
         let mut words = vec![0xffff_ffffu32; EXPERT_MASK_STRIDE];
         if let Some(pool) = &mut self.pool {
             anyhow::ensure!(allowed.len() <= pool.size, "{} experts do not fit a pool of {}", allowed.len(), pool.size);
+            let device = pool.device;
             let entry = pool.layers.get_mut(layer).with_context(|| format!("layer {layer} has no experts in the pool"))?;
-            let wanted: std::collections::BTreeSet<usize> = allowed.iter().copied().collect();
-            // Free the slots of experts that are no longer wanted, then fill the free slots with the new ones.
-            for slot in entry.slots.iter_mut() {
-                if matches!(slot, Some(expert) if !wanted.contains(expert)) {
-                    *slot = None;
+            // `allowed` is in priority order: the first `device` experts belong in device memory, the rest in host memory.
+            let mut order: Vec<usize> = Vec::with_capacity(allowed.len());
+            for &expert in allowed {
+                if !order.contains(&expert) {
+                    order.push(expert);
                 }
             }
-            let resident: std::collections::BTreeSet<usize> = entry.slots.iter().flatten().copied().collect();
-            let mut free: Vec<usize> = (0..entry.slots.len()).filter(|&slot| entry.slots[slot].is_none()).collect();
-            let map = self._gguf.mapped();
-            for &expert in wanted.iter().filter(|expert| !resident.contains(expert)) {
-                let slot = free.pop().context("no free slot in the pool")?;
-                for (index_stride, tensor_name) in [(entry.gate_up, "ffn_gate_up_exps"), (entry.down, "ffn_down_exps")] {
-                    let (buffer, stride) = index_stride;
-                    let tensor = self._gguf.tensor(&format!("blk.{layer}.{tensor_name}.weight")).context("expert tensor missing")?;
-                    let from = tensor.offset + expert * stride;
-                    self.weights[buffer].as_mut_slice::<u8>()[slot * stride..(slot + 1) * stride].copy_from_slice(&map[from..from + stride]);
-                    // The copy is the resident one: let the file's pages go so the page cache does not keep a second copy.
-                    self._gguf.advise(from, stride, false);
+            let slot_of: std::collections::HashMap<usize, usize> = entry.slots.iter().enumerate().filter_map(|(slot, expert)| expert.map(|expert| (expert, slot))).collect();
+            // Which experts stay where they are, and which have to be placed (loaded from the file, or moved between the tiers).
+            let mut to_place: Vec<(usize, bool, Option<usize>)> = Vec::new(); // (expert, wants device, current slot)
+            let mut keep = std::collections::HashSet::new();
+            for (rank, &expert) in order.iter().enumerate() {
+                let wants_device = rank < device;
+                match slot_of.get(&expert) {
+                    Some(&slot) if (slot < device) == wants_device => {
+                        keep.insert(slot);
+                    }
+                    other => to_place.push((expert, wants_device, other.copied())),
                 }
-                entry.slots[slot] = Some(expert);
+            }
+            // The bytes of the experts that move: read them before their old slot is reused.
+            let map = self._gguf.mapped();
+            let mut moving: Vec<(usize, bool, [Vec<u8>; 2])> = Vec::new();
+            for &(expert, wants_device, current) in &to_place {
+                let mut data = [Vec::new(), Vec::new()];
+                for (index, (tier, tensor_name)) in [(entry.gate_up, "ffn_gate_up_exps"), (entry.down, "ffn_down_exps")].into_iter().enumerate() {
+                    data[index] = match current {
+                        Some(slot) if slot < device => self.weights[tier.device].read_bytes(slot * tier.stride, tier.stride),
+                        Some(slot) => {
+                            let host = tier.host.context("a host slot without a host buffer")?;
+                            self.weights[host].read_bytes((slot - device) * tier.stride, tier.stride)
+                        }
+                        None => {
+                            let tensor = self._gguf.tensor(&format!("blk.{layer}.{tensor_name}.weight")).context("expert tensor missing")?;
+                            let from = tensor.offset + expert * tier.stride;
+                            let bytes = map[from..from + tier.stride].to_vec();
+                            // The copy is the resident one: let the file's pages go so the page cache does not keep a second copy.
+                            self._gguf.advise(from, tier.stride, false);
+                            bytes
+                        }
+                    };
+                }
+                moving.push((expert, wants_device, data));
+            }
+            let mut free_device: Vec<usize> = (0..device).filter(|slot| !keep.contains(slot)).collect();
+            let mut free_host: Vec<usize> = (device..entry.slots.len()).filter(|slot| !keep.contains(slot)).collect();
+            free_device.reverse();
+            free_host.reverse();
+            let mut slots = vec![None; entry.slots.len()];
+            for &slot in &keep {
+                slots[slot] = entry.slots[slot];
+            }
+            for (expert, wants_device, data) in moving {
+                let slot = if wants_device { free_device.pop() } else { free_host.pop() }.context("no free slot in the pool")?;
+                for (index, tier) in [entry.gate_up, entry.down].into_iter().enumerate() {
+                    if slot < device {
+                        self.weights[tier.device].write_bytes(slot * tier.stride, &data[index])?;
+                    } else {
+                        let host = tier.host.context("a host slot without a host buffer")?;
+                        self.weights[host].write_bytes((slot - device) * tier.stride, &data[index])?;
+                    }
+                }
+                slots[slot] = Some(expert);
                 copied += 1;
             }
+            entry.slots = slots;
             for (slot, expert) in entry.slots.iter().enumerate() {
                 if let Some(expert) = expert {
                     words[*expert] = slot as u32 + 1;
@@ -473,7 +560,7 @@ impl Runtime {
         }
     }
 
-    fn encode_dispatch(&self, program: &Program, dispatch: &Dispatch, encoder: &crate::metal::Encoder) {
+    fn encode_dispatch(&self, program: &Program, dispatch: &Dispatch, encoder: &Encoder) {
         encoder.kernel(&self.kernels[dispatch.kernel]);
         for (index, arg) in dispatch.args.iter().enumerate() {
             match arg {
@@ -576,7 +663,7 @@ impl Runtime {
         ensure!(tokens > 0 && tokens <= VISION_BATCH, "an image of {tokens} tokens does not fit the plan that reads images ({VISION_BATCH})");
         let index = self.programs.iter().position(|program| program.vision).context("the runtime has no plan for images")?;
         if self.extra.as_ref().is_none_or(|extra| extra.bytes() < VISION_BATCH * width * 4) {
-            self.extra = Some(self.gpu.buffer(VISION_BATCH * width * 4)?);
+            self.extra = Some(self.gpu.buffer_shared(VISION_BATCH * width * 4)?);
         }
         self.extra.as_mut().expect("made above").as_mut_slice::<f32>()[..embeddings.len()].copy_from_slice(embeddings);
         let ids: Vec<u32> = (0..tokens as u32).map(|row| 0x8000_0000 | row).collect();
@@ -624,7 +711,7 @@ impl Runtime {
 
     /// The key and value caches of a layer (for tests and comparisons).
     pub fn read_cache(&self, layer: usize) -> Option<(Vec<f32>, Vec<f32>)> {
-        let widen = |buffer: &Buffer| buffer.as_slice::<u16>().iter().map(|&bits| crate::quant::half_to_f32(bits)).collect::<Vec<f32>>();
+        let widen = |buffer: &Buffer| buffer.to_vec::<u16>().iter().map(|&bits| crate::quant::half_to_f32(bits)).collect::<Vec<f32>>();
         self.caches[self.slot].get(&layer).map(|(key, value)| (widen(key), widen(value)))
     }
 
@@ -639,13 +726,13 @@ impl Runtime {
     pub fn read_value_of(&self, batch: usize, value: usize) -> Vec<f32> {
         let program = self.programs.iter().find(|program| program.batch == batch).expect("no plan of that batch");
         let canonical = program.canonical[value];
-        program.values[canonical].as_ref().map(|buffer| buffer.as_slice::<f32>().to_vec()).unwrap_or_default()
+        program.values[canonical].as_ref().map(|buffer| buffer.to_vec::<f32>()).unwrap_or_default()
     }
 
     /// The elements of a value of the one-token plan after the last step (for tests and comparisons).
     pub fn read_value(&self, value: usize) -> Vec<f32> {
         let program = &self.programs[0];
         let canonical = program.canonical[value];
-        program.values[canonical].as_ref().map(|buffer| buffer.as_slice::<f32>().to_vec()).unwrap_or_default()
+        program.values[canonical].as_ref().map(|buffer| buffer.to_vec::<f32>()).unwrap_or_default()
     }
 }

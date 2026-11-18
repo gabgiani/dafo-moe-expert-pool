@@ -39,7 +39,6 @@ pub fn is_artifact(path: &Path) -> bool {
 
 /// Writes the folder `directory` for the model at `weights`, compiled for `context` tokens. `copy` makes a copy of the weights
 /// instead of linking them.
-#[cfg(target_os = "macos")]
 pub fn write(directory: &Path, weights: &Path, gguf: &Gguf, plans: &[crate::backend_metal::Plan], context: usize, copy: bool, projector: Option<&Path>) -> Result<()> {
     std::fs::create_dir_all(directory).with_context(|| format!("cannot create {}", directory.display()))?;
     let weights = weights.canonicalize()?;
@@ -71,7 +70,7 @@ pub fn write(directory: &Path, weights: &Path, gguf: &Gguf, plans: &[crate::back
     };
     let tokenizer = super::tokenizer::from_gguf(gguf)?;
     tokenizer.save(directory.join("tokenizer.json"), false).map_err(anyhow::Error::msg)?;
-    std::fs::write(directory.join("kernels.metal"), &plans[0].source)?;
+    std::fs::write(directory.join(if cfg!(target_os = "macos") { "kernels.metal" } else { "kernels.cu" }), &plans[0].source)?;
     let name = match gguf.metadata("general.name") {
         Some(Scalar::Text(name)) => name.clone(),
         _ => weights.file_stem().map(|stem| stem.to_string_lossy().into_owned()).unwrap_or_default(),

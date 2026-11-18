@@ -1,24 +1,21 @@
 ---
-title: A Mixture-of-Experts model with every expert available, on a 16 GB Mac
+title: What a compiled model gives you
 ---
 
-# Every expert available, 16 GB of memory
+# A compiled language model: what you can do with it
 
-This repository serves **Gemma 4 26B-A4B** (a mixture-of-experts model: 128 experts per layer, 8 chosen per token) on a Mac with
-**16 GB of RAM** at about **24 tokens/s**, while **all 128 experts of every layer stay available**: the ones the conversation needs are
-moved into memory on the fly, and when the choice settles they stay.
+You compile a model file (GGUF) once and get a folder that any program can serve: an **OpenAI-compatible API with a bearer token**, a **chat page with image attachments**,
+**tool calls**, **conversation caching**, and **image reading through a native vision encoder**. For a mixture-of-experts model that does not fit your memory it also gives
+you something no other engine does on a 16 GB Mac: **all the experts of the model stay available**, and the ones your conversations need are moved into memory by themselves.
 
-The model file is 15.8 GiB, so it cannot be loaded whole. Instead of cutting experts away for good (the usual way to fit it), a **pool**
-of 48 experts per layer (7.4 GiB) is resident, the router is told which experts are in it, and the pool is refilled from the file on disk.
-
-| Page | What it explains |
+| You want to… | Read |
 |---|---|
-| [How the compiler works](how-it-works.md) | GGUF → graph → plans → one command buffer per token; why this is a *compiler* and not an interpreter |
-| [The expert pool](expert-pool.md) | the technique: router mask + slot indirection, equal to a cut model at every moment |
-| [The adaptive pool](adaptive.md) | exchanging experts by demand, settling on a block, thawing on a topic change; the debug mode |
-| [Measurements](results.md) | speed, equality with the cut model, which policy picks experts best (and the limits of those numbers) |
-| [The vision encoder](vision.md) | a native Metal encoder for Gemma 4's projector: images through the same engine, no framework |
-| [Run it](run.md) | build, compile, serve, chat page and API |
-| [Limits](limits.md) | what is not done, what was not measured |
+| compile a model, serve it, call the API, open the chat | [Use it](use.md) |
+| know what the compiled model can do (API fields, tools, chat, images, cache) | [Features](features.md) |
+| understand why compiling is better than interpreting, and where it is *not* | [Why a compiler](why-compiled.md) |
+| run a model larger than your memory with all its experts available | [The expert pool](expert-pool.md) |
+| know how the experts to keep in memory are chosen, and how that changes while you work | [Choosing experts](choosing-experts.md) |
+| read images | [The vision encoder](vision.md) |
+| see the numbers | [Measurements](RESULTS.md) · [Limits](limits.md) |
 
-Everything here was built and measured on one machine (Apple M4, 16 GB). Where something is a simulation or was not measured, the page says so.
+Platforms: **macOS on Apple silicon** (Metal) and **Windows or Linux with an NVIDIA GPU** (CUDA). One model family so far: Gemma 4.

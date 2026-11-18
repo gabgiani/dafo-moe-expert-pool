@@ -5,7 +5,7 @@
 
 pub mod artifact;
 pub mod chat;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 pub mod engine;
 pub mod sampler;
 pub mod tokenizer;

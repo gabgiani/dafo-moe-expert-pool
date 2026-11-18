@@ -45,7 +45,7 @@ fn main() -> Result<()> {
     };
     let gguf = std::sync::Arc::new(Gguf::open(&model)?);
     let graph = frontends::token_graph(&gguf)?;
-    let plan = backend_metal::compile(&graph, &gguf, 512, 1, false)?;
+    let plan = backend_metal::compile_for(backend_metal::Target::native(), &graph, &gguf, 512, 1, false)?;
     let mut runtime = Runtime::new(&gguf, &[plan], 1)?;
     for (position, &token) in tokens.iter().enumerate() {
         runtime.step(token, position)?;

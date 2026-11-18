@@ -41,7 +41,7 @@ version number for it.
 | `--pool N` | keep `N` experts per layer in memory out of the model's (128 for Gemma 4 26B-A4B); give it the **full** GGUF. [How it works](expert-pool.md) |
 | `--profile FILE` | the experts to load at start: JSON `{"layer": [expert ids]}` |
 | `--profiles DIR` | a folder of `name.json` profiles a request or `POST /v1/experts` can switch to |
-| `--adaptive` | exchange experts by what the requests ask for, until the pool settles ([adaptive pool](adaptive.md)) |
+| `--adaptive` | exchange experts by what the requests ask for, until the pool settles ([choosing experts](choosing-experts.md)) |
 | `--debug` | after every request, print the share of the pool that was exchanged, per layer; the chat header shows it too |
 | `--projector FILE` | the vision projector (`mmproj-*.gguf`; one beside the model is found by itself); needs a build with `--features vision`. [How it works](vision.md) |
 | `--open` | open the chat page in the browser; the link carries the token (`#token=...`) so nothing has to be typed |

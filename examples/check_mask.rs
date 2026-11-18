@@ -4,16 +4,18 @@
 //!
 //!   check_mask CUT.gguf                       the cut, every expert it has
 //!   check_mask FULL.gguf --select cal48.json  the full model, only the experts the cut kept
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 fn main() -> anyhow::Result<()> {
     use dafo_compiler_llm::{backend_metal, frontends, gguf::Gguf, runtime::Runtime};
     let mut arguments = std::env::args().skip(1);
     let model = arguments.next().expect("MODEL.gguf");
-    let (mut select, mut pool, mut swap) = (None, None, None::<String>);
+    let (mut select, mut pool, mut swap, mut serial, mut vram) = (None, None, None::<String>, false, None::<usize>);
     while let Some(flag) = arguments.next() {
         match flag.as_str() {
             "--select" => select = arguments.next(),
             "--swap" => swap = arguments.next(),
+            "--serial" => serial = true,
+            "--vram" => vram = arguments.next().map(|n| n.parse::<usize>().expect("vram experts")),
             "--pool" => pool = arguments.next().map(|n| n.parse::<usize>().expect("pool size")),
             other => panic!("unknown option {other}"),
         }
@@ -23,9 +25,12 @@ fn main() -> anyhow::Result<()> {
     if let Some(size) = pool {
         backend_metal::use_expert_pool(&mut graph, size);
     }
-    let plans = backend_metal::compile_plans(&graph, &gguf, 2048, false)?;
+    let plans = backend_metal::compile_plans_for(backend_metal::Target::native(), &graph, &gguf, 2048, false)?;
     let started = std::time::Instant::now();
-    let mut runtime = Runtime::with_expert_pool(&gguf, &plans, 1, pool)?;
+    let mut runtime = Runtime::with_expert_tiers(&gguf, &plans, 1, pool.map(|size| match vram {
+        Some(device) if device < size => (device, size - device),
+        _ => (size, 0),
+    }))?;
     println!("runtime ready in {:.1} s ({:.2} GiB of weights)", started.elapsed().as_secs_f64(), runtime.weight_bytes() as f64 / (1u64 << 30) as f64);
     if let Some(file) = select {
         let text = std::fs::read_to_string(&file)?;
@@ -43,7 +48,16 @@ fn main() -> anyhow::Result<()> {
     let text = "Customer invoice 90044 is overdue by 25 days. Write a short, polite reminder email that mentions the amount due and the payment terms.";
     let prompt: Vec<u32> = tokenizer.encode(text, true).map_err(anyhow::Error::msg)?.get_ids().to_vec();
     runtime.select_slot(0);
-    let mut next = runtime.prefill(&prompt, 0)?;
+    let mut next = if serial {
+        // One token at a time, no batch plan.
+        let mut next = 0;
+        for (position, &token) in prompt.iter().enumerate() {
+            next = runtime.step(token, position)?.0;
+        }
+        next
+    } else {
+        runtime.prefill(&prompt, 0)?
+    };
     let mut position = prompt.len();
     let mut out = Vec::new();
     for _ in 0..24 {
@@ -97,5 +111,5 @@ fn main() -> anyhow::Result<()> {
     }
     Ok(())
 }
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
 fn main() {}

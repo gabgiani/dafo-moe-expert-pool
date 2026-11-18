@@ -2,7 +2,7 @@
 //! a few statistics, the time, and optionally writes the embeddings as raw little-endian f32 to a file.
 //!
 //!   encode_image MMPROJ.gguf IMAGE.png [OUT.f32] [MAX_TOKENS]
-#[cfg(all(feature = "vision", target_os = "macos"))]
+#[cfg(all(feature = "vision", any(target_os = "macos", windows, target_os = "linux")))]
 fn main() -> anyhow::Result<()> {
     let mut arguments = std::env::args().skip(1);
     let projector = arguments.next().expect("MMPROJ.gguf");
@@ -30,5 +30,5 @@ fn main() -> anyhow::Result<()> {
     }
     Ok(())
 }
-#[cfg(not(all(feature = "vision", target_os = "macos")))]
+#[cfg(not(all(feature = "vision", any(target_os = "macos", windows, target_os = "linux"))))]
 fn main() {}

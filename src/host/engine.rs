@@ -81,7 +81,10 @@ struct Slot {
 /// the model file, with the experts of `profile` (a JSON `{"layer": [expert ids]}`, as written by scripts/dev/moe-trace-stats.py) when given.
 #[derive(Clone, Debug)]
 pub struct PoolConfig {
+    /// Experts per layer kept resident in all.
     pub size: usize,
+    /// Of those, how many sit in device memory (the rest in pinned host memory, read over PCIe; CUDA only). `None`: all of them.
+    pub device_experts: Option<usize>,
     /// The experts to load at start.
     pub profile: Option<std::path::PathBuf>,
     /// A folder of `name.json` profiles a request (or `POST /v1/experts`) can switch to on the fly.
@@ -139,6 +142,7 @@ impl Engine {
     pub fn start_with(weights: &Path, tokenizer: Tokenizer, context: usize, slots: usize, options: EngineOptions) -> Result<Self> {
         let EngineOptions { pool, projector, visual_tokens } = options;
         let visual_tokens = if visual_tokens == 0 { 560 } else { visual_tokens };
+        anyhow::ensure!(visual_tokens <= backend_metal::VISION_BATCH || projector.is_none(), "the plan that reads images holds {} soft tokens: --visual-tokens {visual_tokens} does not fit (use 70, 140, 280 or 560)", backend_metal::VISION_BATCH);
         let weights = weights.to_path_buf();
         let (jobs, receiver) = mpsc::channel::<Message>();
         let mut profiles: std::collections::BTreeMap<String, Profile> = Default::default();
@@ -170,8 +174,11 @@ impl Engine {
                     Some(path) => Some(open_vision(path, visual_tokens)?),
                     None => None,
                 };
-                let plans = backend_metal::compile_plans(&graph, &gguf, context, vision.is_some())?;
-                let mut runtime = Runtime::with_expert_pool(&gguf, &plans, slots, pool.as_ref().map(|pool| pool.size))?;
+                let plans = backend_metal::compile_plans_for(backend_metal::Target::native(), &graph, &gguf, context, vision.is_some())?;
+                let mut runtime = Runtime::with_expert_tiers(&gguf, &plans, slots, pool.as_ref().map(|pool| match pool.device_experts {
+                    Some(device) if device < pool.size => (device, pool.size - device),
+                    _ => (pool.size, 0),
+                }))?;
                 if let Some(profile) = pool.as_ref().and_then(|pool| pool.profile.as_ref()) {
                     let total = gguf.tensor("blk.0.ffn_gate_inp.weight").context("a mixture-of-experts model")?.dims[1] as usize;
                     let started = std::time::Instant::now();

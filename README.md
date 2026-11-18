@@ -1,47 +1,36 @@
 # Every expert available, 16 GB of memory
 
-**A mixture-of-experts LLM (Gemma 4 26B-A4B, 128 experts per layer) running on a Mac with 16 GB of RAM at about 24 tokens/s, with all 128
-experts of every layer still reachable.** The ones the conversation needs are moved into memory on the fly; when the choice settles they stay.
-
-* It is a **compiler**: it reads the GGUF file, builds the graph of one token and turns it into a fixed plan of Metal dispatches (Rust, no llama.cpp or Candle).
-* The 15.8 GiB model does not fit in the ~11 GiB a 16 GB Mac gives to the GPU, so only a **pool of 48 experts per layer (7.4 GiB)** is resident. The
-  router is told which experts are in the pool (the rest get a logit of −∞, so the weights renormalize among the others — exactly what a model cut to
-  those experts computes) and the pool is **refilled from the file on disk**, between tokens, by what the router keeps asking for.
-* When the exchange stops being needed (three requests in a row change at most 1 % of the pool) the block is **frozen** and nothing moves any more:
-  a specialist for that workload. If the topic changes, it thaws.
-* It **reads images** with a native Metal vision encoder (no framework; `--features vision`, [how it works](docs/vision.md)).
-* A **debug mode** shows which share of the pool was exchanged after the prompt and after each answer, per layer.
-* `dafo-serve` is an OpenAI-compatible server (bearer token, streaming, tools, text attachments) with a chat page; its link carries the token, so nothing has to be typed.
+**A compiled language-model engine (Rust, Metal and CUDA) that serves a mixture-of-experts model larger than your memory with all of its experts still available.** Gemma 4 26B-A4B (128 experts per layer, 15.8 GiB) runs on a Mac with 16 GB of RAM at about
+24 tokens/s: 48 experts per layer stay resident, every other expert is one disk read away, and the ones your conversations need are moved into memory by themselves until the choice settles.
 
 ```
-cargo build --release --features host
-./target/release/dafo-serve gemma-4-26B-A4B-it-UD-Q4_K_M.gguf --port 8091 --context 4096 --slots 1 \
-  --pool 48 --profile profiles/cal48.json --profiles profiles --adaptive --debug --open
+cargo build --release --features "host vision"
+dafo-serve gemma-4-26B-A4B-it-UD-Q4_K_M.gguf --pool 48 --profile profiles/cal48.json --profiles profiles --adaptive --debug --open
 ```
 
-## Read how it works
+## What you get from a compiled model
+* An **OpenAI-compatible API with a bearer token** (streaming, tool calls, `usage`) and a **chat page** with text and image attachments; the link carries the token, so nothing has to be typed. → [Features](docs/features.md)
+* **Images** read by a native vision encoder on the same GPU (no second runtime). → [The vision encoder](docs/vision.md)
+* **Conversation caching** with prefix reuse, a compiled **folder** you can move between machines, sampling, and a library API.
+* **Two platforms:** macOS on Apple silicon (Metal) and Windows/Linux with an NVIDIA GPU (CUDA, loaded at run time).
+* **Control of the expert pool** while it runs: see which share of it was exchanged after each prompt and answer (`--debug`, `GET /v1/experts`, the chat header), switch profiles, freeze it, turn adaptation off.
 
-| | |
-|---|---|
-| [The expert pool](docs/expert-pool.md) | the technique: router mask + slot indirection; why a mask equals a cut; why mapping the whole file fails on 16 GB |
-| [The adaptive pool](docs/adaptive.md) | exchange by demand, settle, freeze, thaw; the debug mode; an observed run |
-| [Measurements](docs/results.md) | speed (23.8 tok/s with the pool, 24.7 for the cut file), equality with the cut, and a simulation of which experts to keep |
-| [The vision encoder](docs/vision.md) | a native Metal encoder for Gemma 4's projector, checked against a reference (cosine 0.999999) |
-| [How the compiler works](docs/how-it-works.md) | GGUF → graph → passes → Metal plan → runtime |
-| [Run it](docs/run.md) · [Server](docs/SERVER.md) · [Limits](docs/limits.md) | |
+## The technique, in short
+1. **Measure** which experts the router uses on real work, by tracing the full model. → [Choosing experts](docs/choosing-experts.md)
+2. **A cut is a mask.** The router renormalizes among the experts it picks, so removing an expert is the same as blocking it; a pool of slots in memory, with a table from expert to slot, makes any set of experts a model that costs only the pool's memory. → [The expert pool](docs/expert-pool.md)
+3. **Exchange by demand.** The router also reports which experts it wanted but did not find; after each prompt and answer the pool swaps its weakest experts for the most wanted ones, settles when nothing changes, and resumes if the topic does.
+4. **Compile.** The dispatch plan only names buffers, so swapping what is *in* the buffers needs no recompilation. → [Why a compiler](docs/why-compiled.md)
 
 ## Honest summary
+* Measured on an Apple M4 with 16 GB: 23.7–23.8 tokens/s with the pool (24.7 for a fixed 48-expert cut); the pool's logits are **identical** to the cut's; exchanging 32 experts takes 0.23 s.
+* **On a 16 GB Mac only this engine runs the complete model**: llama.cpp and Candle need all 15.8 GiB mapped. Their numbers in the comparison table are for the 48-expert cut.
+* At any moment the model uses the experts that are resident: a specialist that follows the work, not the full model at full quality. Reading the prompt predicts the experts (+10 points over a fixed set at 48 per layer, a simulation).
+* **On a 6 GB NVIDIA card the complete model runs at about 3 tokens/s, which is not usable;** the CUDA backend is correct and fast when the experts fit in video memory (44 tokens/s with a 12-expert model).
+* Settling on a long real workload, answer quality against the complete model, and pools of 72+ were **not** measured. → [Limits](docs/limits.md) · [Measurements](docs/RESULTS.md)
 
-* Measured (Apple M4, 16 GB): **23.7–23.8 tok/s** generating and about 160 tok/s reading a prompt with the pool of 48; the pool's logits are **identical** to a 48-expert
-  cut file's; swapping 32 experts takes 0.23 s.
-* At any moment the model is a **48-expert** model: this is not full-model quality. What is new is that no expert is thrown away and the 48 follow the conversation.
-* Which experts to keep resident was studied on a trace of the full model (`analysis/`): reading the prompt predicts the experts (+10 points of main-expert
-  coverage over a fixed set at 48 per layer, a *simulation*). Settling on a long real workload, answer quality against the full model, and pools of 72+ (they do not fit 16 GB)
-  were **not** measured. See [Limits](docs/limits.md).
-* One model family, one backend (Metal). The original compiler README is [docs/COMPILER.md](docs/COMPILER.md).
+## How to use it
+→ [Use it](docs/use.md): build, compile to a folder, serve, call the API, open the chat, run on Windows.
 
 ## License and credits
-
-MIT (see `LICENSE`). The matrix-matrix kernels (`src/backend_metal/matmul.metal`) are adapted from [llama.cpp](https://github.com/ggml-org/llama.cpp) (MIT) through the copy in
-`candle-metal-kernels`; see `NOTICE`. The GGUF format is the one defined by the ggml project. Gemma is a model of Google and is subject to the Gemma Terms of Use; the
-model file is not included. `analysis/llama-moe-trace.patch` is a patch for llama.cpp's server that records which experts the router chooses.
+MIT (see `LICENSE`). The matrix-matrix kernels (`src/backend_metal/matmul.metal`) are adapted from [llama.cpp](https://github.com/ggml-org/llama.cpp) (MIT) through the copy in `candle-metal-kernels`; see `NOTICE`.
+The GGUF format is the one defined by the ggml project. Gemma is a model of Google and is subject to the Gemma Terms of Use; no model file is included. `analysis/` holds the scripts and the llama.cpp patch used to measure the router.

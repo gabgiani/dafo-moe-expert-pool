@@ -27,7 +27,7 @@ fn main() -> Result<()> {
     match command.as_str() {
         "inspect" => inspect(&model, context),
         "compile" => compile(&model, context, flag_text(&rest, "--out")?, rest.iter().any(|argument| argument == "--copy-weights"), flag_text(&rest, "--projector")?),
-        "bench" => bench(&model, context, flag(&rest, "--pool")?),
+        "bench" => bench(&model, context, flag(&rest, "--pool")?, flag(&rest, "--vram-experts")?),
         _ => bail!("{}", usage()),
     }
 }
@@ -84,7 +84,6 @@ fn inspect(model: &str, context: usize) -> Result<()> {
         gib(traffic.small)
     );
     println!("  generation is memory-bound: at 100 GB/s that is at most {:.1} tokens/s", 100e9 / traffic.total() as f64);
-    #[cfg(target_os = "macos")]
     {
         let (fixed, per_token) = dafo_compiler_llm::backend_metal::cache_footprint(&graph);
         println!(
@@ -94,18 +93,16 @@ fn inspect(model: &str, context: usize) -> Result<()> {
             (fixed + per_token * context) as f64 / 1048576.0
         );
     }
-    #[cfg(not(target_os = "macos"))]
-    let _ = context;
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 fn compile(model: &str, context: usize, out: Option<String>, copy_weights: bool, projector: Option<String>) -> Result<()> {
     use dafo_compiler_llm::backend_metal;
     let gguf = Gguf::open(model)?;
     let graph = frontends::token_graph(&gguf)?;
     let started = std::time::Instant::now();
-    let plans = backend_metal::compile_plans(&graph, &gguf, context, projector.is_some())?;
+    let plans = backend_metal::compile_plans_for(backend_metal::Target::native(), &graph, &gguf, context, projector.is_some())?;
     println!("compiled in {:.2} s for a context of {context} tokens:", started.elapsed().as_secs_f64());
     for plan in &plans {
         println!("  batch {:>4}: {} dispatches, {} scratch buffers", plan.batch, plan.steps.len(), plan.scratch.len());
@@ -128,8 +125,8 @@ fn compile(model: &str, context: usize, out: Option<String>, copy_weights: bool,
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
-fn bench(model: &str, context: usize, pool: Option<usize>) -> Result<()> {
+#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
+fn bench(model: &str, context: usize, pool: Option<usize>, device: Option<usize>) -> Result<()> {
     use dafo_compiler_llm::{backend_metal, runtime::Runtime};
     use std::time::Instant;
     let gguf = std::sync::Arc::new(Gguf::open(model)?);
@@ -137,8 +134,11 @@ fn bench(model: &str, context: usize, pool: Option<usize>) -> Result<()> {
     if let Some(size) = pool {
         backend_metal::use_expert_pool(&mut graph, size);
     }
-    let plans = backend_metal::compile_plans(&graph, &gguf, context, false)?;
-    let mut runtime = Runtime::with_expert_pool(&gguf, &plans, 1, pool)?;
+    let plans = backend_metal::compile_plans_for(backend_metal::Target::native(), &graph, &gguf, context, false)?;
+    let mut runtime = Runtime::with_expert_tiers(&gguf, &plans, 1, pool.map(|size| match device {
+        Some(device) if device < size => (device, size - device),
+        _ => (size, 0),
+    }))?;
     println!("{} on {}: {:.2} GiB of weights mapped, {} dispatches per token", model, runtime.device_name(), gib(runtime.weight_bytes()), runtime.dispatch_count());
     // Prompt reading: batched, on a prompt of varied ids.
     let prompt: Vec<u32> = (0..512u32).map(|index| 1000 + (index * 7919) % 20000).collect();
@@ -160,12 +160,12 @@ fn bench(model: &str, context: usize, pool: Option<usize>) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
 fn compile(_: &str, _: usize, _: Option<String>, _: bool, _: Option<String>) -> Result<()> {
     bail!("compiling needs a Mac: the first backend targets Metal (inspect works anywhere)")
 }
 
-#[cfg(not(target_os = "macos"))]
-fn bench(_: &str, _: usize, _: Option<usize>) -> Result<()> {
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
+fn bench(_: &str, _: usize, _: Option<usize>, _: Option<usize>) -> Result<()> {
     bail!("benchmarking needs a Mac: the first backend targets Metal (inspect works anywhere)")
 }

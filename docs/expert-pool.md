@@ -51,5 +51,5 @@ model *is* a 48-expert model; what changes is which 48.
 
 * It is **not** the full 128-expert model at full quality: at any moment the router can only use the experts in the pool. The claim is that
   **every expert is reachable** — none is discarded for good — and that the pool can be exchanged on the fly.
-* How good the answers are depends on how well the 48 resident experts match the conversation. [The adaptive pool](adaptive.md) is the part that
-  tries to make them match.
+* How good the answers are depends on how well the 48 resident experts match the conversation. [Choosing experts](choosing-experts.md) is the part that
+  decides which ones, and how they change while you work.

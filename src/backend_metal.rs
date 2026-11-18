@@ -14,6 +14,7 @@ use crate::ir::{AttentionKind, Graph, Op, Value, Weight};
 
 const KERNELS: &str = include_str!("backend_metal/kernels.metal");
 const MATMUL: &str = include_str!("backend_metal/matmul.metal");
+const CUDA_KERNELS: &str = include_str!("backend_cuda/kernels.cu");
 /// Rows per SIMD group and SIMD groups per thread group of the matrix-vector products.
 const ROWS_PER_SIMD_GROUP: usize = 4;
 const SIMD_GROUPS: usize = 2;
@@ -45,6 +46,10 @@ pub enum Arg {
     /// A value starting `bytes` after its first element.
     ValueAt(Value, usize),
     Weight(String),
+    /// The part of an expert tensor that lives in pinned host memory (CUDA with two tiers of experts; the weight itself otherwise).
+    WeightHost(String),
+    /// Number of expert slots that live in device memory (the rest are in the host part); larger than any slot when all do.
+    DeviceSlots,
     CacheKey(usize),
     CacheValue(usize),
     Table(usize),
@@ -131,6 +136,7 @@ pub struct Plan {
 }
 
 struct Builder<'a> {
+    target: Target,
     gguf: &'a Gguf,
     plan: Plan,
     /// Elements of each value for one token.
@@ -391,18 +397,23 @@ impl Builder<'_> {
                         Encoding::Q8_0 => "mv_id_q8_0",
                         other => bail!("{}: no expert kernel for {other:?}", weight.name),
                     };
+                    let host = Arg::WeightHost(weight.name.clone());
                     let weight = self.weight(weight);
+                    let mut arguments = vec![
+                        weight,
+                        Arg::Value(*ids),
+                        Arg::Value(*input),
+                        Arg::Value(*output),
+                        Arg::U32(*width as u32),
+                        Arg::U32(*rows as u32),
+                        Arg::U32(if *per_slot_input { *width as u32 } else { 0 }),
+                    ];
+                    if self.target == Target::Cuda {
+                        arguments.extend([host, Arg::DeviceSlots]);
+                    }
                     self.step(
                         kernel,
-                        vec![
-                            weight,
-                            Arg::Value(*ids),
-                            Arg::Value(*input),
-                            Arg::Value(*output),
-                            Arg::U32(*width as u32),
-                            Arg::U32(*rows as u32),
-                            Arg::U32(if *per_slot_input { *width as u32 } else { 0 }),
-                        ],
+                        arguments,
                         [blocks(*rows, ROWS_PER_SIMD_GROUP * SIMD_GROUPS), *used, 1],
                         [SIMD_GROUPS * 32, 1, 1],
                     );
@@ -447,12 +458,14 @@ impl Builder<'_> {
                     ensure!(width % 32 == 0 && width % per_block == 0, "{}: width {width} does not fit the batched kernel", weight.name);
                     let row_bytes = (width / per_block * block_bytes) as u64;
                     let input_rows = if *per_slot_input { *used } else { 1 };
+                    let host = Arg::WeightHost(weight.name.clone());
                     let weight = self.weight(weight);
                     let shared = (8192 + batch * 4).div_ceil(16) * 16;
                     ensure!(shared <= 32768, "the batch is too large for the batched expert kernel");
+                    let cuda = self.target == Target::Cuda;
                     self.plan.steps.push(Step {
                         kernel,
-                        args: vec![
+                        args: [vec![
                             weight,
                             Arg::Value(*input),
                             Arg::Value(*output),
@@ -470,7 +483,7 @@ impl Builder<'_> {
                             Arg::U64(*width as u64 * 4 * input_rows as u64),
                             Arg::I64(*rows as i64),
                             Arg::I64(*used as i64),
-                        ],
+                        ], if cuda { vec![host, Arg::DeviceSlots] } else { Vec::new() }].concat(),
                         groups: [blocks(batch, 32), blocks(*rows, 64), *total],
                         threads: [128, 1, 1],
                         shared_memory: shared,
@@ -577,6 +590,28 @@ fn assign_buffers(graph: &Graph, reuse: bool) -> Vec<Value> {
 /// hold; with `reuse` the plan's activations share buffers once their values are dead (without it every value keeps its own,
 /// which tests read back).
 pub fn compile(graph: &Graph, gguf: &Gguf, max_context: usize, batch: usize, reuse: bool) -> Result<Plan> {
+    compile_for(Target::Metal, graph, gguf, max_context, batch, reuse)
+}
+
+/// The GPU language a plan's kernels are written in. The dispatches are the same: both sets of kernels take the same arguments in the same
+/// order and a thread group is a block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Target {
+    /// Metal Shading Language (Apple GPUs).
+    Metal,
+    /// CUDA C++, compiled at run time by NVRTC (NVIDIA GPUs).
+    Cuda,
+}
+
+impl Target {
+    /// The GPU language of the machine this program runs on: Metal on a Mac, CUDA elsewhere.
+    pub fn native() -> Self {
+        if cfg!(target_os = "macos") { Target::Metal } else { Target::Cuda }
+    }
+}
+
+/// [`compile`] for a given [`Target`].
+pub fn compile_for(target: Target, graph: &Graph, gguf: &Gguf, max_context: usize, batch: usize, reuse: bool) -> Result<Plan> {
     ensure!((1..=VISION_BATCH).contains(&batch), "a plan takes between 1 and {VISION_BATCH} tokens");
     let canonical = assign_buffers(graph, reuse);
     let mut lens = vec![0; graph.values()];
@@ -584,6 +619,7 @@ pub fn compile(graph: &Graph, gguf: &Gguf, max_context: usize, batch: usize, reu
         lens[owner] = lens[owner].max(graph.lens[value] * batch);
     }
     let mut builder = Builder {
+        target,
         gguf,
         plan: Plan {
             source: String::new(),
@@ -622,7 +658,10 @@ pub fn compile(graph: &Graph, gguf: &Gguf, max_context: usize, batch: usize, reu
     );
     let mut plan = builder.plan;
     plan.weights = builder.weights.into_iter().collect();
-    plan.source = format!("{header}{KERNELS}\n{MATMUL}");
+    plan.source = match target {
+        Target::Metal => format!("{header}{KERNELS}\n{MATMUL}"),
+        Target::Cuda => format!("{header}{CUDA_KERNELS}"),
+    };
     Ok(plan)
 }
 
@@ -631,12 +670,17 @@ pub const PROMPT_BATCHES: [usize; 2] = [128, 16];
 
 /// The plans a runtime needs: the one-token plan, then one per prompt batch size and, with `vision`, the plan that reads an image.
 pub fn compile_plans(graph: &Graph, gguf: &Gguf, max_context: usize, vision: bool) -> Result<Vec<Plan>> {
-    let mut plans = vec![compile(graph, gguf, max_context, 1, true)?];
+    compile_plans_for(Target::Metal, graph, gguf, max_context, vision)
+}
+
+/// [`compile_plans`] for a given [`Target`].
+pub fn compile_plans_for(target: Target, graph: &Graph, gguf: &Gguf, max_context: usize, vision: bool) -> Result<Vec<Plan>> {
+    let mut plans = vec![compile_for(target, graph, gguf, max_context, 1, true)?];
     for batch in PROMPT_BATCHES {
-        plans.push(compile(graph, gguf, max_context, batch, true)?);
+        plans.push(compile_for(target, graph, gguf, max_context, batch, true)?);
     }
     if vision {
-        plans.push(compile(graph, gguf, max_context, VISION_BATCH, true)?);
+        plans.push(compile_for(target, graph, gguf, max_context, VISION_BATCH, true)?);
     }
     Ok(plans)
 }

@@ -15,8 +15,8 @@ fn main() -> Result<()> {
     let gguf = std::sync::Arc::new(Gguf::open(&model)?);
     let graph = frontends::token_graph(&gguf)?;
     // No buffer reuse in either plan: every value stays readable after the run.
-    let single = backend_metal::compile(&graph, &gguf, 512, 1, false)?;
-    let batched = backend_metal::compile(&graph, &gguf, 512, n, false)?;
+    let single = backend_metal::compile_for(backend_metal::Target::native(), &graph, &gguf, 512, 1, false)?;
+    let batched = backend_metal::compile_for(backend_metal::Target::native(), &graph, &gguf, 512, n, false)?;
     let tokens: Vec<u32> = (0..n as u32 + 1).map(|index| [2u32, 105, 2364, 107, 5279, 529, 7001, 563, 9259, 236761, 1018, 1884, 563, 506, 5279, 529][index as usize % 16] + index).collect();
     let mut runtime = Runtime::new(&gguf, &[single, batched], 1)?;
 

@@ -23,10 +23,19 @@ use anyhow::{Context, Result, bail, ensure};
 use image::imageops::FilterType;
 
 use crate::gguf::{Gguf, Scalar};
-use crate::metal::{Buffer, Gpu, Kernel};
+#[cfg(target_os = "macos")]
+use crate::metal::{Buffer, Encoder, Gpu, Kernel};
+#[cfg(not(target_os = "macos"))]
+use crate::cuda::{Buffer, Encoder, Gpu, Kernel};
 
+#[cfg(target_os = "macos")]
 const MATMUL: &str = include_str!("backend_metal/matmul.metal");
+#[cfg(target_os = "macos")]
 const VISION: &str = include_str!("backend_metal/vision.metal");
+#[cfg(not(target_os = "macos"))]
+const CUDA_KERNELS: &str = include_str!("backend_cuda/kernels.cu");
+#[cfg(not(target_os = "macos"))]
+const CUDA_VISION: &str = include_str!("backend_cuda/vision.cu");
 /// Fewest cells an image is scaled up to (the reference preprocessor's minimum).
 const MIN_SOFT_TOKENS: usize = 70;
 const POOL: usize = 3;
@@ -95,14 +104,18 @@ impl VisionEncoder {
         }
         let output = gguf.tensor("mm.input_projection.weight").context("the projector has no mm.input_projection.weight")?.dims[1] as usize;
         let gpu = Gpu::new()?;
+        #[cfg(target_os = "macos")]
         let source = format!("#include <metal_stdlib>\nusing namespace metal;\n{MATMUL}\n{VISION}");
+        #[cfg(not(target_os = "macos"))]
+        let source = format!("#define NR 4\n#define NSG 2\n#define STATE_VISION 584\n#define ROUTE_MAX_WIDTH 2816\n#define ROUTE_MAX_EXPERTS 128\n#define ROUTE_MAX_USED 8\n{CUDA_KERNELS}\n{CUDA_VISION}");
         let library = gpu.library(&source)?;
         let mut kernels = std::collections::HashMap::new();
         for name in ["mm_f16", "v_patchify", "v_add_position", "v_rms_norm", "v_add", "v_gelu_mul", "v_rope", "v_to_half", "v_attention", "v_pool"] {
             kernels.insert(name, gpu.kernel(&library, name)?);
         }
         let map = gguf.mapped();
-        let length = map.len().div_ceil(PAGE) * PAGE;
+        // Metal wraps whole pages; a copy to another device stops at the end of the file.
+        let length = if cfg!(target_os = "macos") { map.len().div_ceil(PAGE) * PAGE } else { map.len() };
         let weights = unsafe { gpu.buffer_no_copy(map.as_ptr(), length)? };
         Ok(Self {
             gpu,
@@ -192,7 +205,7 @@ impl VisionEncoder {
         let kernels = &self.kernels;
 
         // One matrix product: `rows` x `k` F16 weights (at `weight` in the file) times `tokens` rows of `input`, rows `input_stride` apart.
-        let matmul = |encoder: &crate::metal::Encoder, weight: usize, k: usize, rows: usize, input: &Buffer, input_stride: usize, output: &Buffer, tokens: usize| {
+        let matmul = |encoder: &Encoder, weight: usize, k: usize, rows: usize, input: &Buffer, input_stride: usize, output: &Buffer, tokens: usize| {
             let row_bytes = (k * 2) as u64;
             let k_steps = k.div_ceil(32) * 32;
             encoder.kernel(&kernels["mm_f16"]);
@@ -216,7 +229,7 @@ impl VisionEncoder {
             encoder.shared_memory(0, 8192);
             encoder.dispatch([tokens.div_ceil(32), rows.div_ceil(64), 1], [128, 1, 1]);
         };
-        let rms = |encoder: &crate::metal::Encoder, input: &Buffer, scale: Option<usize>, output: &Buffer, width: usize, groups: usize| {
+        let rms = |encoder: &Encoder, input: &Buffer, scale: Option<usize>, output: &Buffer, width: usize, groups: usize| {
             encoder.kernel(&kernels["v_rms_norm"]);
             encoder.buffer(0, input, 0);
             encoder.buffer(1, weights, scale.unwrap_or(0));
@@ -226,14 +239,14 @@ impl VisionEncoder {
             encoder.value(5, &(scale.is_some() as u32));
             encoder.dispatch([groups, 1, 1], [32, 1, 1]);
         };
-        let add = |encoder: &crate::metal::Encoder, target: &Buffer, other: &Buffer, n: usize| {
+        let add = |encoder: &Encoder, target: &Buffer, other: &Buffer, n: usize| {
             encoder.kernel(&kernels["v_add"]);
             encoder.buffer(0, target, 0);
             encoder.buffer(1, other, 0);
             encoder.value(2, &(n as u32));
             encoder.dispatch([n.div_ceil(256), 1, 1], [256, 1, 1]);
         };
-        let rope = |encoder: &crate::metal::Encoder, input: &Buffer, output: &Buffer| {
+        let rope = |encoder: &Encoder, input: &Buffer, output: &Buffer| {
             encoder.kernel(&kernels["v_rope"]);
             encoder.buffer(0, input, 0);
             encoder.buffer(1, output, 0);
@@ -301,7 +314,11 @@ impl VisionEncoder {
                 encoder.buffer(3, &attention, 0);
                 encoder.value(4, &patches_u);
                 encoder.value(5, &(heads as u32));
+                #[cfg(target_os = "macos")]
                 encoder.dispatch([padded / 8, heads, 1], [32, 1, 1]);
+                // The CUDA kernel takes 32 queries of a head per block of 128 threads.
+                #[cfg(not(target_os = "macos"))]
+                encoder.dispatch([patches.div_ceil(32), heads, 1], [128, 1, 1]);
                 matmul(encoder, layer["attn_out"], hidden, hidden, &attention, hidden, &temporary, patches);
                 rms(encoder, &temporary, Some(layer["attn_post_norm"]), &temporary, hidden, patches);
                 add(encoder, &x, &temporary, patches * hidden);
@@ -336,7 +353,8 @@ impl VisionEncoder {
             rms(encoder, &pooled, None, &pooled, hidden, cells);
             matmul(encoder, projection, hidden, self.output, &pooled, hidden, &result, cells);
         })?;
-        let embeddings = result.as_slice::<f32>()[..cells * self.output].to_vec();
+        let mut embeddings = result.to_vec::<f32>();
+        embeddings.truncate(cells * self.output);
         Ok(EncodedImage { embeddings, tokens: cells, width: self.output })
     }
 }

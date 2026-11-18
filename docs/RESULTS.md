@@ -4,6 +4,8 @@ title: Measurements
 
 # Measurements
 
+The engineering detail of the Apple-silicon work, including every optimization that did **not** work, is in [what was tried](what-was-tried.md).
+
 Machine: Apple M4, 16 GB, macOS. Model: `gemma-4-26B-A4B-it-UD-Q4_K_M.gguf` (15.8 GiB, 128 experts per layer). Every number below was measured here
 unless it says *simulation*.
 
@@ -54,3 +56,15 @@ marks with any cut and the failures moved between cuts without a clear order; Sp
 
 The pool is the expert memory: *N* experts × 3.72 MB × 30 layers (48 → 7.41 GiB; 72 → 10.5 GiB, which does **not** leave room on a 16 GB Mac and was not run).
 The full file is only read to refill slots; after each copy the file's pages are released so the page cache does not hold a second copy.
+
+## NVIDIA (CUDA) on a Windows laptop
+RTX 3060 Laptop GPU, 6 GB of video memory, 23.7 GB of RAM, PCIe measured at 5.6 GB/s (DMA copy) and 3.5 GB/s (a kernel reading pinned host memory). `dafo-compile bench`:
+
+| Configuration | Generation | Prompt reading |
+|---|---|---|
+| a 12-expert-per-layer cut (3.6 GiB) entirely in video memory | 43.9 tok/s | 210 tok/s |
+| the 48-expert cut with a pool of 16 in video memory | 43.4 tok/s | 203 tok/s |
+| the **complete** 128-expert model, a pool of 48 (12 in video memory, 36 in pinned RAM) | 2.8 tok/s | 4 tok/s |
+
+Correctness: `check_ops` 928 of 928 operations equal to the CPU; batched plans against single-token ones within about 1e-4 relative (on Metal, whose matrix kernels pass the weights through half, 2e-3 to 4e-3);
+a pool of 12 experts gives the same logits as a model of 12; a pool with 4 experts in video memory and 8 in RAM gives the **same logits, bit for bit,** as all 12 in video memory. The CUDA vision encoder matches the Metal one (cosine similarity 1.000000 on average, 0.999996 at worst, over 252 soft tokens).

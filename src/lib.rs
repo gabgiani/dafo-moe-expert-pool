@@ -21,3 +21,6 @@ pub mod vision;
 /// The CUDA device layer (NVIDIA GPUs on Windows and Linux); the driver and NVRTC are loaded when the first device is made.
 #[cfg(any(windows, target_os = "linux"))]
 pub mod cuda;
+/// The catalog of models that can be pulled (`dafo-compile list`, `pull`, `rm`).
+#[cfg(feature = "pull")]
+pub mod models;

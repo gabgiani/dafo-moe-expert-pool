@@ -1,8 +1,10 @@
 ---
-title: Why a compiler
+title: Why a Compiler
 ---
 
-# Why compile a model instead of interpreting it
+# Why a Compiler
+
+_What compiling does once instead of on every token, what it buys and where it does not help_
 
 ## What an interpreter does on every token
 A typical engine walks the model for each token: for every operation the host code picks a kernel, sets its arguments, allocates temporaries and launches it. That is thousands of small decisions and launches per token (a Gemma 4 token is 933 operations),

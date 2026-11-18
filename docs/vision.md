@@ -1,8 +1,10 @@
 ---
-title: The native vision encoder
+title: The Native Vision Encoder
 ---
 
-# The native vision encoder
+# The Native Vision Encoder
+
+_Reading images with Gemma 4's projector, on Metal and CUDA, with no framework_
 
 Gemma 4 reads images through a projector file (`mmproj-*.gguf`, projector type `gemma4v`): a 27-layer vision transformer (hidden size 1152, 16 heads of 72,
 F16 weights, 1.19 GiB) that turns an image into *soft tokens*, vectors the language model reads in place of text tokens. `src/vision.rs` is that

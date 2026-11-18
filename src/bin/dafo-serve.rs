@@ -57,7 +57,7 @@ mod server {
     }
 
     fn usage() -> &'static str {
-        "usage: dafo-serve MODEL.dafo|MODEL.gguf [--host H] [--port P] [--token T] [--context TOKENS] [--slots N] [--pool EXPERTS [--vram-experts N] [--profile FILE] [--profiles DIR] [--adaptive] [--debug]] [--projector FILE [--visual-tokens N]] [--open]"
+        "usage: dafo-serve MODEL.dafo|MODEL.gguf|NAME [--host H] [--port P] [--token T] [--context TOKENS] [--slots N] [--pool EXPERTS [--vram-experts N] [--profile FILE] [--profiles DIR] [--adaptive] [--debug]] [--projector FILE [--visual-tokens N]] [--open]"
     }
 
     fn option(arguments: &[String], name: &str) -> Result<Option<String>> {
@@ -87,6 +87,18 @@ mod server {
         let generated = supplied.is_none();
         let token = supplied.unwrap_or_else(random_token);
 
+        // A name that is not a path is a model pulled with `dafo-compile pull`.
+        let model = if model.exists() {
+            model
+        } else {
+            match dafo_compiler_llm::models::resolve(&model.to_string_lossy()) {
+                Some(path) => {
+                    eprintln!("model {} found in {}", model.display(), dafo_compiler_llm::models::models_dir().display());
+                    path
+                }
+                None => anyhow::bail!("{} is neither a file nor a pulled model (see: dafo-compile list, dafo-compile pull NAME)", model.display()),
+            }
+        };
         let (weights, tokenizer, name, context, stored_projector, stored_tokens) = if artifact::is_artifact(&model) {
             let opened = artifact::read(&model)?;
             (opened.weights, opened.tokenizer, opened.name, context_option.unwrap_or(opened.context), opened.projector, Some(opened.visual_tokens))

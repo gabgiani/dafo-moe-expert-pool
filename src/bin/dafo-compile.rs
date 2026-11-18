@@ -1,5 +1,8 @@
 //! `dafo-compile`: look at a model, compile it for this Mac's GPU and measure the result, without any host application.
 //!
+//!   dafo-compile list                                    the models you can pull (like `ollama list`)
+//!   dafo-compile pull NAME                               download a model and its projector, joining the chunks (like `ollama pull`)
+//!   dafo-compile rm NAME                                 delete a pulled model
 //!   dafo-compile inspect MODEL.gguf                      what the model is, what a token reads, what the caches cost
 //!   dafo-compile compile MODEL.gguf [--context N] [--out DIR [--copy-weights]] [--projector MMPROJ.gguf]
 //!                                                        build the plans for this machine and report them; with --out, leave
@@ -21,6 +24,17 @@ use dafo_compiler_llm::{frontends, gguf::Gguf};
 fn main() -> Result<()> {
     let mut arguments = std::env::args().skip(1);
     let command = arguments.next().unwrap_or_default();
+    // The commands about the catalog take a model *name*, not a file.
+    #[cfg(feature = "pull")]
+    match command.as_str() {
+        "list" | "ls" => return dafo_compiler_llm::models::print_list(),
+        "pull" => {
+            let name = arguments.next().with_context(|| "usage: dafo-compile pull NAME   (see: dafo-compile list)")?;
+            return dafo_compiler_llm::models::pull(&name).map(|_| ());
+        }
+        "rm" => return dafo_compiler_llm::models::remove(&arguments.next().with_context(|| "usage: dafo-compile rm NAME")?),
+        _ => {}
+    }
     let model = arguments.next().with_context(|| usage())?;
     let rest: Vec<String> = arguments.collect();
     let context = flag(&rest, "--context")?.unwrap_or(8192);
@@ -33,7 +47,7 @@ fn main() -> Result<()> {
 }
 
 fn usage() -> String {
-    "usage: dafo-compile inspect|compile|bench MODEL.gguf [--context TOKENS]".to_owned()
+    "usage: dafo-compile inspect|compile|bench MODEL.gguf [--context TOKENS]\n       dafo-compile list | pull NAME | rm NAME      (models of the DAFO catalog; needs a build with --features host)".to_owned()
 }
 
 fn flag(arguments: &[String], name: &str) -> Result<Option<usize>> {

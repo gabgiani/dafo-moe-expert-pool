@@ -4,6 +4,8 @@ title: Limits
 
 # Limits
 
+_What is not done and what was not measured_
+
 * **One model family.** Gemma 4 (the mixture-of-experts 26B-A4B for the expert pool; the dense and small variants have the compiled path but not the pool). Another family is a new frontend.
 * **Two GPU languages, unequal maturity.** Metal is the tuned one. The CUDA kernels are a first version: no tensor cores yet, matrix-vector products at about a third of video-memory bandwidth, and on Windows/Linux the Swarm's own engine does not use them yet (only `dafo-serve` and `dafo-compile`).
 * **A complete model larger than video memory is slow on a small NVIDIA card.** With the experts split between video memory and system RAM, the GPU reads the RAM ones over PCIe (3.5 GB/s measured for a kernel, 5.6 GB/s for a DMA copy on an RTX 3060 laptop):

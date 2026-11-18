@@ -1,8 +1,10 @@
 ---
-title: Choosing which experts to keep in memory
+title: Choosing Which Experts to Keep in Memory
 ---
 
-# How we decided which experts to load, and how that changes while you work
+# Choosing Which Experts to Keep in Memory
+
+_The method, what it taught us, and how the pool changes while you work_
 
 Gemma 4 26B-A4B has 30 layers of 128 experts; the router picks 8 per token. The experts are 13.4 of the model's 15.8 GiB. A 16 GB Mac cannot hold them all, so something has to decide **which experts are in memory**.
 This page is the method we used and what it taught us. The mechanism that makes it possible (a router mask and a pool of slots, with the rest of the file on disk) is in [The expert pool](expert-pool.md).

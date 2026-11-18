@@ -1,8 +1,12 @@
 ---
-title: What a compiled model gives you
+title: DAFO Compiler
 ---
 
-# A compiled language model: what you can do with it
+# DAFO Compiler
+
+_A compiler for language models: serve a model with an OpenAI-compatible API, a chat and images, and run a mixture-of-experts model larger than your memory with all its experts available._
+
+## What a compiled model gives you
 
 You compile a model file (GGUF) once and get a folder that any program can serve: an **OpenAI-compatible API with a bearer token**, a **chat page with image attachments**,
 **tool calls**, **conversation caching**, and **image reading through a native vision encoder**. For a mixture-of-experts model that does not fit your memory it also gives

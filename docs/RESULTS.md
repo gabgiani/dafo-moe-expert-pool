@@ -4,6 +4,8 @@ title: Measurements
 
 # Measurements
 
+_Speed, correctness and the selection simulation, with their limits_
+
 The engineering detail of the Apple-silicon work, including every optimization that did **not** work, is in [what was tried](what-was-tried.md).
 
 Machine: Apple M4, 16 GB, macOS. Model: `gemma-4-26B-A4B-it-UD-Q4_K_M.gguf` (15.8 GiB, 128 experts per layer). Every number below was measured here

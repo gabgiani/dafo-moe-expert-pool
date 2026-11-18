@@ -2,7 +2,9 @@
 title: Features
 ---
 
-# What a compiled model can do
+# Features
+
+_The API, tools, images, the chat page, the conversation cache and the expert controls_
 
 Everything below is served by one program, `dafo-serve`, over a compiled model (see [Use it](use.md)). It serves one request at a time (a queue) and keeps several conversations in cache.
 

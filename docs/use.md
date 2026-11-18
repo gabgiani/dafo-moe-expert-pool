@@ -1,18 +1,31 @@
 ---
-title: Use it
+title: Use It
 ---
 
-# Compile a model, serve it, talk to it
+# Use It
+
+_Pull a model, compile it, serve it, call the API_
 
 ## Requirements
 * A Mac with Apple silicon, or a Windows/Linux machine with an NVIDIA GPU (driver installed; the CUDA toolkit is *not* needed to build or run: NVRTC is loaded at run time).
 * Rust 1.85+ to build.
-* A Gemma 4 GGUF (for example `gemma-4-26B-A4B-it-UD-Q4_K_M.gguf` from Hugging Face; Gemma is subject to the Gemma Terms of Use) and, for images, its projector `mmproj-*.gguf`.
+* A Gemma 4 GGUF: pull one with `dafo-compile pull` (below), or bring your own (for example `gemma-4-26B-A4B-it-UD-Q4_K_M.gguf` from Hugging Face; Gemma is subject to the Gemma Terms of Use) with its projector `mmproj-*.gguf` for images.
 
 ```
 cargo build --release --features "host vision"
 ```
 (`host` is the server and chat; `vision` adds image reading and pulls one dependency, the `image` crate.)
+
+## 0. Get a model (like `ollama pull`)
+```
+dafo-compile list                                  # the models you can pull, with their size and which are already here
+dafo-compile pull gemma-4-26b-a4b-q4-k-m-pool      # download it and its vision projector
+dafo-serve gemma-4-26b-a4b-q4-k-m-pool --open      # serve it by name
+dafo-compile rm gemma-4-26b-a4b-cut48-q4-k-m       # delete one
+```
+`list` reads the same catalog the DAFO Swarm nodes read (a release of `gabgiani/dafo-swarm-downloads`) and shows only the models this compiler can run. `pull` rebuilds a model that is published in chunks (the 48-expert cut) by downloading each chunk,
+checking it against its own SHA-256, joining them, and checking the finished file; a damaged chunk is fetched again and the rest are kept. A model served from one address (the complete 128-expert file, from Hugging Face) is downloaded with resume.
+Both pull the vision projector too, so images work at once. Everything goes to `~/.dafo/models/<name>/` (`DAFO_MODELS` changes it; `DAFO_CATALOG_URL` points to another catalog). If a pull is interrupted, run it again and it resumes.
 
 ## 1. Look at the model first
 ```
@@ -63,6 +76,7 @@ Images, tools and every field are in [Features](features.md).
 | `--context N` | tokens of context per conversation |
 | `--slots N` | conversations kept in cache (default 2) |
 | `--projector FILE`, `--visual-tokens N` | vision projector and the most soft tokens one image may use (70, 140, 280 or 560) |
+| `NAME` instead of a path | a model pulled with `dafo-compile pull` |
 | `--pool N` | experts per layer kept resident; give the **full** GGUF |
 | `--vram-experts V` | of those, how many in video memory (CUDA); the rest in pinned system RAM |
 | `--profile FILE`, `--profiles DIR` | the experts to start with, and a folder of named profiles to switch between |

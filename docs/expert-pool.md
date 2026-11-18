@@ -1,8 +1,10 @@
 ---
-title: The expert pool
+title: The Expert Pool
 ---
 
-# The expert pool: how all 128 experts stay available
+# The Expert Pool
+
+_How all 128 experts stay available on a 16 GB machine_
 
 ## The problem
 

@@ -21,6 +21,18 @@ name = "dafo-serve"
 path = "src/bin/dafo-serve.rs"
 required-features = ["host"]
 
+[[example]]
+name = "check_mask"
+required-features = ["host"]
+
+[[example]]
+name = "encode_image"
+required-features = ["vision"]
+
+[[example]]
+name = "encode"
+required-features = ["host"]
+
 [dependencies]
 anyhow = "1.0"
 memmap2 = "0.9"

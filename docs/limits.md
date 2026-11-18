@@ -16,6 +16,6 @@ _What is not done and what was not measured_
 * **Settling was designed and its parts observed, not shown on a long real workload.** In the runs reported the pool had not settled yet. With the adaptive pool on, the same request repeated can come back worded differently (the pool changed between the two).
 * **72 experts and larger pools** need more memory than a 16 GB Mac has; they were not run.
 * **Speed:** about 24 tokens/s generating and 160 tokens/s reading a prompt on an M4; llama.cpp reads prompts 1.5–2× faster on the same machine.
-* **`dafo-serve` serves one request at a time** (a queue), reads images only as `data:` URLs, and does not do JSON-schema constrained output (the Swarm's own engine does).
+* **Concurrent requests take turns; they are not batched.** Several requests run at once, one token each in turn, so the total speed does not grow with the number of requests. Decoding them in one pass (the weights read once for all) would raise it, and needs each token of a pass to carry its own position and cache. `dafo-serve` reads images only as `data:` URLs and does not do JSON-schema constrained output (the Swarm's own engine does).
 * **Exchanging experts happens between requests** (and once after the prompt), never in the middle of an answer. The images' soft-token plan holds 576 tokens, so a budget of 1120 does not fit.
 * **The 15.8 GiB file must be on a local disk;** it is read only to refill slots.

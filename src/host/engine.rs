@@ -18,6 +18,17 @@ use crate::frontends;
 use crate::gguf::{Gguf, Scalar};
 use crate::runtime::Runtime;
 
+/// Set by a program that holds a conversation in the terminal, so the engine's progress lines do not break into it.
+pub static QUIET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+macro_rules! note {
+    ($($argument:tt)*) => {
+        if !QUIET.load(std::sync::atomic::Ordering::Relaxed) {
+            eprintln!($($argument)*);
+        }
+    };
+}
+
 /// Tokens read per turn of the engine loop, so a cancelled request is noticed within a slice.
 const READ_SLICE: usize = 512;
 
@@ -75,6 +86,32 @@ pub struct Engine {
 struct Slot {
     history: Vec<u32>,
     last_used: u64,
+    /// A request is running in this conversation.
+    busy: bool,
+}
+
+enum Stage {
+    Reading,
+    Generating,
+}
+
+/// A request in progress: it takes one turn of the engine at a time (a slice of its prompt, or one token of its answer), so several run at once.
+struct Active {
+    job: Job,
+    slot: usize,
+    ids: Vec<u32>,
+    runs: Vec<ImageRun>,
+    cursor: usize,
+    reused: usize,
+    max_tokens: usize,
+    stage: Stage,
+    sampler: Sampler,
+    generated: Vec<u32>,
+    text: String,
+    emitted: usize,
+    hold: usize,
+    logits: Vec<f32>,
+    started: std::time::Instant,
 }
 
 /// Serve a model with more experts than fit in memory: the expert tensors live in a pool of `size` experts per layer that is filled from
@@ -87,6 +124,8 @@ pub struct PoolConfig {
     pub device_experts: Option<usize>,
     /// The experts to load at start.
     pub profile: Option<std::path::PathBuf>,
+    /// The experts to start with when there is no profile file (hottest first).
+    pub initial: Option<Profile>,
     /// A folder of `name.json` profiles a request (or `POST /v1/experts`) can switch to on the fly.
     pub profiles_dir: Option<std::path::PathBuf>,
     /// Let the engine move experts in and out of the pool by what the requests ask for, until it settles (see [`Adaptive`]).
@@ -159,7 +198,8 @@ impl Engine {
         let stored = profiles.clone();
         let current = Arc::new(std::sync::Mutex::new(pool.as_ref().and_then(|pool| pool.profile.as_ref()).map(|path| path.file_stem().map(|stem| stem.to_string_lossy().into_owned()).unwrap_or_default()).unwrap_or_default()));
         let shared_current = Arc::clone(&current);
-        let adaptive_pool = AdaptivePool::new(0, pool.as_ref().is_some_and(|pool| pool.adaptive), pool.as_ref().is_some_and(|pool| pool.debug));
+        let mut adaptive_pool = AdaptivePool::new(0, pool.as_ref().is_some_and(|pool| pool.adaptive), pool.as_ref().is_some_and(|pool| pool.debug));
+        adaptive_pool.set_logger(|line| note!("{line}"));
         let status = Arc::clone(&adaptive_pool.status);
         let profiles_dir = pool.as_ref().and_then(|pool| pool.profiles_dir.clone());
         let (ready_sender, ready) = mpsc::channel::<Result<(String, usize, bool)>>();
@@ -179,6 +219,15 @@ impl Engine {
                     Some(device) if device < pool.size => (device, pool.size - device),
                     _ => (pool.size, 0),
                 }))?;
+                if let Some(initial) = pool.as_ref().filter(|pool| pool.profile.is_none()).and_then(|pool| pool.initial.as_ref()) {
+                    let total = gguf.tensor("blk.0.ffn_gate_inp.weight").context("a mixture-of-experts model")?.dims[1] as usize;
+                    let started = std::time::Instant::now();
+                    let mut copied = 0;
+                    for (layer, ids) in initial {
+                        copied += runtime.set_allowed_experts(*layer, ids, total)?;
+                    }
+                    note!("starting experts loaded into the pool: {copied} copied in {:.1} s", started.elapsed().as_secs_f64());
+                }
                 if let Some(profile) = pool.as_ref().and_then(|pool| pool.profile.as_ref()) {
                     let total = gguf.tensor("blk.0.ffn_gate_inp.weight").context("a mixture-of-experts model")?.dims[1] as usize;
                     let started = std::time::Instant::now();
@@ -186,7 +235,7 @@ impl Engine {
                     for (layer, ids) in read_profile(profile)? {
                         copied += runtime.set_allowed_experts(layer, &ids, total)?;
                     }
-                    eprintln!("experts of {} loaded into the pool: {copied} copied in {:.1} s", profile.display(), started.elapsed().as_secs_f64());
+                    note!("experts of {} loaded into the pool: {copied} copied in {:.1} s", profile.display(), started.elapsed().as_secs_f64());
                 }
                 Ok((gguf, runtime, vision))
             })();
@@ -287,41 +336,103 @@ impl Worker {
             stop_tokens.push(*eos as u32);
         }
         stop_tokens.extend(["<turn|>", "<|tool_response>"].iter().filter_map(|token| tokenizer.token_to_id(token)));
-        Self { runtime, tokenizer, slots: (0..slots).map(|_| Slot { history: Vec::new(), last_used: 0 }).collect(), context, stop_tokens, clock: 0, profiles, current_profile, experts_total: gguf.tensor("blk.0.ffn_gate_inp.weight").map(|tensor| tensor.dims[1] as usize).unwrap_or(0), pool, profiles_dir, vision, image_cache: Vec::new() }
+        Self { runtime, tokenizer, slots: (0..slots).map(|_| Slot { history: Vec::new(), last_used: 0, busy: false }).collect(), context, stop_tokens, clock: 0, profiles, current_profile, experts_total: gguf.tensor("blk.0.ffn_gate_inp.weight").map(|tensor| tensor.dims[1] as usize).unwrap_or(0), pool, profiles_dir, vision, image_cache: Vec::new() }
     }
 
+    /// Takes requests from `messages` and runs them, a turn each, until the channel closes: while one request reads its prompt or writes its
+    /// answer the others advance too, each in a conversation (slot) of its own.
     fn run(mut self, messages: Receiver<Message>) {
-        for message in messages {
-            match message {
-                Message::Job(job) => {
-                    if job.cancel.load(Ordering::Acquire) {
-                        continue;
-                    }
-                    let events = job.events.clone();
-                    if let Some(name) = &job.profile {
-                        if let Err(message) = self.switch_profile(name) {
-                            let _ = events.send(Event::Failed { code: "unknown_experts_profile", message });
-                            continue;
-                        }
-                    }
-                    if let Err(error) = self.serve(&job) {
-                        let _ = events.send(Event::Failed { code: "engine_error", message: format!("{error:#}") });
-                    }
-                    if let Some(block) = self.pool.after_request(&mut self.runtime) {
-                        let _ = self.save_profile("settled", &block);
-                        self.profiles.insert("settled".to_owned(), block);
-                        *self.current_profile.lock().unwrap() = "settled".to_owned();
-                    }
+        let mut waiting: std::collections::VecDeque<Job> = std::collections::VecDeque::new();
+        let mut active: Vec<Active> = Vec::new();
+        let mut closed = false;
+        loop {
+            if active.is_empty() && waiting.is_empty() {
+                if closed {
+                    return;
                 }
-                Message::Adaptive { command, reply } => {
-                    let result = self.command(command).map_err(|error| format!("{error:#}"));
-                    let _ = reply.send(result);
-                }
-                Message::SetExperts { name, layers, reply } => {
-                    let result = self.apply(&name, &layers).map_err(|error| format!("{error:#}"));
-                    let _ = reply.send(result);
+                match messages.recv() {
+                    Ok(message) => self.take(message, &mut waiting),
+                    Err(_) => return,
                 }
             }
+            loop {
+                match messages.try_recv() {
+                    Ok(message) => self.take(message, &mut waiting),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        closed = true;
+                        break;
+                    }
+                }
+            }
+            // Start the waiting requests a free conversation can take.
+            while let Some(job) = waiting.front() {
+                if job.cancel.load(Ordering::Acquire) {
+                    waiting.pop_front();
+                    continue;
+                }
+                if self.slots.iter().all(|slot| slot.busy) {
+                    break;
+                }
+                let job = waiting.pop_front().expect("a waiting request");
+                if let Some(name) = &job.profile {
+                    if let Err(message) = self.switch_profile(name) {
+                        let _ = job.events.send(Event::Failed { code: "unknown_experts_profile", message });
+                        continue;
+                    }
+                }
+                let events = job.events.clone();
+                match self.begin(job) {
+                    Ok(Some(request)) => active.push(request),
+                    Ok(None) => {}
+                    Err(error) => {
+                        let _ = events.send(Event::Failed { code: "engine_error", message: format!("{error:#}") });
+                    }
+                }
+            }
+            // One turn for each running request.
+            let mut index = 0;
+            while index < active.len() {
+                match self.advance(&mut active[index]) {
+                    Ok(false) => index += 1,
+                    Ok(true) => {
+                        let request = active.remove(index);
+                        self.slots[request.slot].busy = false;
+                        self.finish_request();
+                    }
+                    Err(error) => {
+                        let request = active.remove(index);
+                        self.slots[request.slot].busy = false;
+                        // The conversation's cache may hold half a request: the next one starts over.
+                        self.slots[request.slot].history.clear();
+                        let _ = request.job.events.send(Event::Failed { code: "engine_error", message: format!("{error:#}") });
+                        self.finish_request();
+                    }
+                }
+            }
+        }
+    }
+
+    fn take(&mut self, message: Message, waiting: &mut std::collections::VecDeque<Job>) {
+        match message {
+            Message::Job(job) => waiting.push_back(job),
+            Message::Adaptive { command, reply } => {
+                let result = self.command(command).map_err(|error| format!("{error:#}"));
+                let _ = reply.send(result);
+            }
+            Message::SetExperts { name, layers, reply } => {
+                let result = self.apply(&name, &layers).map_err(|error| format!("{error:#}"));
+                let _ = reply.send(result);
+            }
+        }
+    }
+
+    /// What follows a request: the pool sees what the router wanted and may exchange experts or settle.
+    fn finish_request(&mut self) {
+        if let Some(block) = self.pool.after_request(&mut self.runtime) {
+            let _ = self.save_profile("settled", &block);
+            self.profiles.insert("settled".to_owned(), block);
+            *self.current_profile.lock().unwrap() = "settled".to_owned();
         }
     }
 
@@ -372,20 +483,21 @@ impl Worker {
         }
         *self.current_profile.lock().unwrap() = name.to_owned();
         let note = format!("experts profile {name}: {copied} experts ({:.0} MB) copied in {:.2} s", copied as f64 * 3.72, started.elapsed().as_secs_f64());
-        eprintln!("{note}");
+        note!("{note}");
         Ok(note)
     }
 
     /// The slot for `prompt` and how much of it the slot already holds.
     fn pick_slot(&self, prompt: &[u32]) -> (usize, usize) {
         (0..self.slots.len())
+            .filter(|&index| !self.slots[index].busy)
             .map(|index| {
                 let history = &self.slots[index].history;
                 (index, reusable_prefix(history, prompt, RING_SLACK), history.is_empty(), self.slots[index].last_used)
             })
             .max_by_key(|&(_, reused, empty, last_used)| (reused, empty, std::cmp::Reverse(last_used)))
             .map(|(index, reused, _, _)| (index, reused))
-            .expect("at least one slot")
+            .expect("a free slot")
     }
 
     /// The embeddings of an image: encoded once, then kept for a while. Returns them with their number of tokens and width.
@@ -402,7 +514,7 @@ impl Worker {
             let vision = self.vision.as_ref().context("the engine has no vision projector")?;
             let started = std::time::Instant::now();
             let encoded = vision.encode(bytes)?;
-            eprintln!("image: {} soft tokens in {:.0} ms", encoded.tokens, started.elapsed().as_secs_f64() * 1000.0);
+            note!("image: {} soft tokens in {:.0} ms", encoded.tokens, started.elapsed().as_secs_f64() * 1000.0);
             let embeddings = Arc::new(encoded.embeddings);
             if self.image_cache.len() >= IMAGE_CACHE {
                 self.image_cache.remove(0);
@@ -442,110 +554,117 @@ impl Worker {
         Ok((prompt, runs))
     }
 
-    fn serve(&mut self, job: &Job) -> Result<()> {
-        let (ids, runs) = match self.tokenize(job) {
+    /// Starts a request: reads its prompt into tokens (and images), picks a free conversation and sets up the turns. `None` when it was
+    /// refused (the reason has been sent).
+    fn begin(&mut self, job: Job) -> Result<Option<Active>> {
+        let (ids, runs) = match self.tokenize(&job) {
             Ok(tokenized) => tokenized,
             Err(error) => {
                 let _ = job.events.send(Event::Failed { code: "invalid_images", message: format!("{error:#}") });
-                return Ok(());
+                return Ok(None);
             }
         };
         if ids.len() + 1 > self.context {
             let _ = job.events.send(Event::Failed {
                 code: "context_length_exceeded",
-                message: format!("the conversation is {} tokens and the model was compiled for {}: start a new chat or compile for a larger context (dafo-serve --context)", ids.len(), self.context),
+                message: format!("the conversation is {} tokens and the model was compiled for {}: start a new chat or use a larger context (--context)", ids.len(), self.context),
             });
-            return Ok(());
+            return Ok(None);
         }
         let max_tokens = job.settings.max_tokens.min(self.context - ids.len()).max(1);
         let (slot, reused) = self.pick_slot(&ids);
-        let started = std::time::Instant::now();
         self.clock += 1;
         self.slots[slot].last_used = self.clock;
+        self.slots[slot].busy = true;
         self.slots[slot].history.truncate(reused);
-        self.runtime.select_slot(slot);
-        let outcome = self.generate(job, slot, &ids, &runs, max_tokens);
-        eprintln!("request: {} prompt tokens ({reused} reused from conversation {slot}) in {:.1} s", ids.len(), started.elapsed().as_secs_f64());
-        if outcome.is_err() {
-            self.slots[slot].history.clear();
-        }
-        outcome
+        let cursor = self.slots[slot].history.len();
+        let hold = job.settings.stop.iter().map(|stop| stop.len()).max().unwrap_or(0);
+        let sampler = Sampler::new(job.settings.sampling.clone());
+        Ok(Some(Active { job, slot, ids, runs, cursor, reused, max_tokens, stage: Stage::Reading, sampler, generated: Vec::new(), text: String::new(), emitted: 0, hold, logits: Vec::new(), started: std::time::Instant::now() }))
     }
 
-    fn generate(&mut self, job: &Job, slot: usize, ids: &[u32], runs: &[ImageRun], max_tokens: usize) -> Result<()> {
-        let mut cursor = self.slots[slot].history.len();
-        while cursor < ids.len() {
-            if job.cancel.load(Ordering::Acquire) {
-                self.slots[slot].history.clear();
-                return Ok(());
-            }
-            // The next image at or after the cursor: text is read up to it, and the image in one piece.
-            let next_image = runs.iter().find(|run| run.start + run.len > cursor);
-            let end = match next_image {
-                Some(run) if run.start == cursor => {
-                    self.runtime.run_image(&run.embeddings, run.width, cursor)?;
-                    let end = cursor + run.len;
-                    self.slots[slot].history.extend_from_slice(&ids[cursor..end]);
-                    cursor = end;
-                    anyhow::ensure!(cursor < ids.len(), "the prompt ends with an image: there is nothing to answer");
-                    continue;
-                }
-                Some(run) => run.start.min(cursor + READ_SLICE),
-                None => (cursor + READ_SLICE).min(ids.len()),
-            };
-            self.runtime.prefill(&ids[cursor..end], cursor)?;
-            self.slots[slot].history.extend_from_slice(&ids[cursor..end]);
-            cursor = end;
+    /// One turn of a request: a slice of its prompt, or one token of its answer. `Ok(true)` when it is over.
+    fn advance(&mut self, request: &mut Active) -> Result<bool> {
+        if request.job.cancel.load(Ordering::Acquire) {
+            self.slots[request.slot].history.clear();
+            return Ok(true);
         }
-        // What the prompt asked of the router tells which experts the answer will want: settle them before decoding.
-        self.pool.after_prompt(&mut self.runtime);
-        let mut logits = self.runtime.logits();
-        let mut sampler = Sampler::new(job.settings.sampling.clone());
-        let mut generated: Vec<u32> = Vec::new();
-        let (mut emitted, mut text) = (0usize, String::new());
-        let hold = job.settings.stop.iter().map(|stop| stop.len()).max().unwrap_or(0);
-        let finish = loop {
-            if job.cancel.load(Ordering::Acquire) {
-                self.slots[slot].history.clear();
-                return Ok(());
-            }
-            let history = &self.slots[slot].history;
-            let window = sampler.window();
-            let recent = if window == 0 { &[][..] } else { &history[history.len().saturating_sub(window)..] };
-            let token = sampler.sample(std::mem::take(&mut logits), recent);
-            if self.stop_tokens.contains(&token) {
-                break "stop";
-            }
-            generated.push(token);
-            text = self.tokenizer.decode(&generated, false).map_err(anyhow::Error::msg)?;
-            if let Some(at) = job.settings.stop.iter().filter_map(|stop| text.find(stop.as_str())).min() {
-                text.truncate(at);
-                break "stop";
-            }
-            if job.stream && !text.ends_with('\u{fffd}') {
-                let mut safe = text.len().saturating_sub(hold);
-                while !text.is_char_boundary(safe) {
-                    safe -= 1;
+        self.runtime.select_slot(request.slot);
+        match request.stage {
+            Stage::Reading => {
+                // The next image at or after the cursor: text is read up to it, and the image in one piece.
+                let next_image = request.runs.iter().find(|run| run.start + run.len > request.cursor);
+                let end = match next_image {
+                    Some(run) if run.start == request.cursor => {
+                        self.runtime.run_image(&run.embeddings, run.width, request.cursor)?;
+                        let end = request.cursor + run.len;
+                        self.slots[request.slot].history.extend_from_slice(&request.ids[request.cursor..end]);
+                        request.cursor = end;
+                        anyhow::ensure!(end < request.ids.len(), "the prompt ends with an image: there is nothing to answer");
+                        return Ok(false);
+                    }
+                    Some(run) => run.start.min(request.cursor + READ_SLICE),
+                    None => (request.cursor + READ_SLICE).min(request.ids.len()),
+                };
+                self.runtime.prefill(&request.ids[request.cursor..end], request.cursor)?;
+                self.slots[request.slot].history.extend_from_slice(&request.ids[request.cursor..end]);
+                request.cursor = end;
+                if end == request.ids.len() {
+                    // What the prompt asked of the router tells which experts the answer will want: settle them before decoding.
+                    request.logits = self.runtime.logits();
+                    self.pool.after_prompt(&mut self.runtime);
+                    request.stage = Stage::Generating;
+                    note!("request: {} prompt tokens ({} reused from conversation {}) in {:.1} s", request.ids.len(), request.reused, request.slot, request.started.elapsed().as_secs_f64());
                 }
-                if safe > emitted {
-                    let _ = job.events.send(Event::Delta(text[emitted..safe].to_owned()));
-                    emitted = safe;
+                Ok(false)
+            }
+            Stage::Generating => {
+                let history = &self.slots[request.slot].history;
+                let window = request.sampler.window();
+                let recent = if window == 0 { &[][..] } else { &history[history.len().saturating_sub(window)..] };
+                let token = request.sampler.sample(std::mem::take(&mut request.logits), recent);
+                let mut finish = None;
+                if self.stop_tokens.contains(&token) {
+                    finish = Some("stop");
+                } else {
+                    request.generated.push(token);
+                    request.text = self.tokenizer.decode(&request.generated, false).map_err(anyhow::Error::msg)?;
+                    if let Some(at) = request.job.settings.stop.iter().filter_map(|stop| request.text.find(stop.as_str())).min() {
+                        request.text.truncate(at);
+                        finish = Some("stop");
+                    } else {
+                        if request.job.stream && !request.text.ends_with('\u{fffd}') {
+                            let mut safe = request.text.len().saturating_sub(request.hold);
+                            while !request.text.is_char_boundary(safe) {
+                                safe -= 1;
+                            }
+                            if safe > request.emitted {
+                                let _ = request.job.events.send(Event::Delta(request.text[request.emitted..safe].to_owned()));
+                                request.emitted = safe;
+                            }
+                        }
+                        if request.generated.len() >= request.max_tokens {
+                            finish = Some("length");
+                        }
+                    }
                 }
+                if let Some(finish) = finish {
+                    if request.job.stream && request.text.len() > request.emitted && request.text.is_char_boundary(request.emitted) {
+                        let _ = request.job.events.send(Event::Delta(request.text[request.emitted..].to_owned()));
+                    }
+                    let text = std::mem::take(&mut request.text);
+                    let _ = request.job.events.send(Event::Done { text, finish, prompt_tokens: request.ids.len(), completion_tokens: request.generated.len() });
+                    return Ok(true);
+                }
+                let position = self.slots[request.slot].history.len();
+                self.runtime.step(token, position)?;
+                self.slots[request.slot].history.push(token);
+                request.logits = self.runtime.logits();
+                Ok(false)
             }
-            if generated.len() >= max_tokens {
-                break "length";
-            }
-            let position = self.slots[slot].history.len();
-            self.runtime.step(token, position)?;
-            self.slots[slot].history.push(token);
-            logits = self.runtime.logits();
-        };
-        if job.stream && text.len() > emitted && text.is_char_boundary(emitted) {
-            let _ = job.events.send(Event::Delta(text[emitted..].to_owned()));
         }
-        let _ = job.events.send(Event::Done { text, finish, prompt_tokens: ids.len(), completion_tokens: generated.len() });
-        Ok(())
     }
+
 }
 
 /// How many leading tokens of `prompt` the caches already hold: the longest start they share with `history`, as long as the caches

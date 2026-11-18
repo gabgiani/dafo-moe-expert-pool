@@ -143,7 +143,7 @@ pub fn print_list() -> Result<()> {
         let size = entry.file.size + entry.extra.iter().map(|file| file.size).sum::<u64>();
         println!("{:<34} {:>7.1} GB  {:<8} {}", entry.id, size as f64 / 1e9, if local.contains(&entry.id) { "yes" } else { "" }, entry.name);
     }
-    println!("\nmodels folder: {}   (pull one with: dafo-compile pull NAME)", models_dir().display());
+    println!("\nmodels folder: {}   (pull one with: dafo-compiler pull NAME)", models_dir().display());
     Ok(())
 }
 
@@ -167,7 +167,14 @@ pub fn pull(name: &str) -> Result<PathBuf> {
         println!("  {} is already here", entry.file.name);
     } else {
         match &entry.mirror {
-            Some(manifest) => pull_from_mirror(manifest, &entry.file, &target)?,
+            Some(manifest) => {
+                if let Err(error) = pull_from_mirror(manifest, &entry.file, &target) {
+                    // The mirror failed: the same file from its original address, if the catalog has one.
+                    let Some(url) = entry.file.url.as_deref() else { return Err(error) };
+                    println!("\n  the mirror failed ({error:#}); trying {url}");
+                    download(url, &target, &entry.file)?;
+                }
+            }
             None => {
                 let url = entry.file.url.as_deref().context("the catalog gives no address for this model")?;
                 download(url, &target, &entry.file)?;

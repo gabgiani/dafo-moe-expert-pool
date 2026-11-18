@@ -69,6 +69,20 @@ pub fn images_of(messages: &[Value]) -> Result<Vec<Vec<u8>>, String> {
     Ok(images)
 }
 
+/// Standard base64 with padding.
+pub fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let value = (chunk[0] as u32) << 16 | (*chunk.get(1).unwrap_or(&0) as u32) << 8 | *chunk.get(2).unwrap_or(&0) as u32;
+        out.push(TABLE[(value >> 18) as usize & 63] as char);
+        out.push(TABLE[(value >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { TABLE[(value >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { TABLE[value as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
 /// Standard base64 (with or without padding); whitespace is ignored.
 pub fn base64_decode(text: &str) -> Option<Vec<u8>> {
     let (mut out, mut buffer, mut bits) = (Vec::with_capacity(text.len() / 4 * 3), 0u32, 0u32);
@@ -329,6 +343,13 @@ mod tests {
         assert_eq!(images_of(&messages).unwrap(), vec![vec![0u8, 1, 2]]);
         let remote = vec![json!({"role": "user", "content": [{"type": "image_url", "image_url": {"url": "https://example.org/a.png"}}]})];
         assert!(images_of(&remote).unwrap_err().contains("data:"));
+    }
+
+    #[test]
+    fn base64_round_trips() {
+        for text in [&b""[..], b"a", b"ab", b"abc", b"hello world"] {
+            assert_eq!(base64_decode(&base64_encode(text)).unwrap(), text);
+        }
     }
 
     #[test]

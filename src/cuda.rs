@@ -47,6 +47,7 @@ api! {
     cu_device_total_mem: fn(*mut usize, c_int) -> CuResult = b"cuDeviceTotalMem_v2\0";
     cu_ctx_create: fn(*mut Handle, c_uint, c_int) -> CuResult = b"cuCtxCreate_v2\0";
     cu_ctx_set_current: fn(Handle) -> CuResult = b"cuCtxSetCurrent\0";
+    cu_ctx_destroy: fn(Handle) -> CuResult = b"cuCtxDestroy_v2\0";
     cu_stream_create: fn(*mut Handle, c_uint) -> CuResult = b"cuStreamCreate\0";
     cu_stream_synchronize: fn(Handle) -> CuResult = b"cuStreamSynchronize\0";
     cu_module_load_data: fn(*mut Handle, *const c_void) -> CuResult = b"cuModuleLoadData\0";
@@ -169,6 +170,13 @@ pub struct Gpu {
     name: String,
     architecture: (c_int, c_int),
     total_memory: usize,
+}
+
+impl Drop for Gpu {
+    fn drop(&mut self) {
+        // Buffers hold their own memory; the context goes when the device layer does.
+        unsafe { (self.api.driver.cu_ctx_destroy)(self.context) };
+    }
 }
 
 pub struct Library(Handle);

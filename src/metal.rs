@@ -92,6 +92,11 @@ impl Gpu {
         }
     }
 
+    /// Memory the GPU may use (bytes): on Apple silicon a share of the unified memory.
+    pub fn working_set_bytes(&self) -> u64 {
+        self.device.recommendedMaxWorkingSetSize()
+    }
+
     /// Largest buffer the device can create.
     pub fn max_buffer_bytes(&self) -> usize {
         self.device.maxBufferLength()

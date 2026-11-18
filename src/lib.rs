@@ -24,3 +24,6 @@ pub mod cuda;
 /// The catalog of models that can be pulled (`dafo-compile list`, `pull`, `rm`).
 #[cfg(feature = "pull")]
 pub mod models;
+/// What this machine can do with a model, without flags (experts in memory, context, conversations at once, images).
+#[cfg(all(feature = "host", any(target_os = "macos", windows, target_os = "linux")))]
+pub mod auto;

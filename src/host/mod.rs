@@ -8,4 +8,6 @@ pub mod chat;
 #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 pub mod engine;
 pub mod sampler;
+#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
+pub mod server;
 pub mod tokenizer;

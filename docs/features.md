@@ -6,7 +6,7 @@ title: Features
 
 _The API, tools, images, the chat page, the conversation cache and the expert controls_
 
-Everything below is served by one program, `dafo-serve`, over a compiled model (see [Use it](use.md)). It serves one request at a time (a queue) and keeps several conversations in cache.
+Everything below is served by one program, `dafo-compiler serve` (or `dafo-serve`, with every option), over a compiled model (see [Use it](use.md)). **Several requests run at once**, each in a conversation of its own (up to 4, from the memory left): they advance by turns, one token each, so a long prompt does not block the others and every request streams as it goes. Interleaving does not raise the total speed: with N requests running each gets about 1/N of it.
 
 ## An OpenAI-compatible API with a bearer token
 | Route | |

@@ -7,15 +7,16 @@ _A compiled language-model engine with an exchangeable, adaptive expert pool —
 
 ```
 cargo build --release --features "host vision"
-dafo-compile pull gemma-4-26b-a4b-q4-k-m-pool       # download the model and its vision projector, like `ollama pull`
-dafo-serve gemma-4-26b-a4b-q4-k-m-pool --pool 48 --profile profiles/cal48.json --profiles profiles --adaptive --debug --open
+dafo-compiler pull gemma4     # downloads the model that fits this machine, with its vision projector
+dafo-compiler serve           # the OpenAI-compatible API and the chat page on :8080
+dafo-compiler chat            # a chat in the terminal
 ```
 
 ## What You Get From a Compiled Model
 * An **OpenAI-compatible API with a bearer token** (streaming, tool calls, `usage`) and a **chat page** with text and image attachments; the link carries the token, so nothing has to be typed. → [Features](docs/features.md)
 * **Images** read by a native vision encoder on the same GPU (no second runtime). → [The vision encoder](docs/vision.md)
 * **Conversation caching** with prefix reuse, a compiled **folder** you can move between machines, sampling, and a library API.
-* **Models by name, like ollama:** `dafo-compile list`, `pull`, `rm`; `dafo-serve NAME`.
+* **Simple, like ollama:** `dafo-compiler pull | list | serve | chat | rm | show`; the machine is looked at and the experts in memory, the context, the requests at once and the images are decided for you. **Several requests run at once.**
 * **Two platforms:** macOS on Apple silicon (Metal) and Windows/Linux with an NVIDIA GPU (CUDA, loaded at run time).
 * **Control of the expert pool** while it runs: see which share of it was exchanged after each prompt and answer (`--debug`, `GET /v1/experts`, the chat header), switch profiles, freeze it, turn adaptation off.
 
